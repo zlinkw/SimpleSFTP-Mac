@@ -18,7 +18,7 @@ const { READ_ONLY_SETTLEMENT_METHODS, clientRequestKey, retryIdentity, localTran
 let transferRecoveryTestHooks = null;
 const transferRecoveries = new Map();
 const { execFile, spawn } = require("child_process");
-const { resolveWorkspaceLocation } = require("./workspace-path.js");
+const { resolveWorkspaceLocation, localPathText, remotePathText } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
 const {
@@ -517,9 +517,10 @@ async function createOrOpenProject(options = {}) {
     const target = resolveCreateProjectTarget(getActiveSharedServer(), cfg, options);
     const writeAgentsFile = cfg.get("writeAgentsFile");
 
-    const remotePath = options.apiMode
-      ? String(options.remotePath || "").trim().replace(/\/+$/, "")
+    const selectedPath = options.apiMode
+      ? remotePathText(options.remotePath, process.platform)
       : await pickRemoteDirectory({ remoteBase: target.remoteBase, sftp: target.sftp });
+    const remotePath = remotePathText(selectedPath, process.platform);
     if (!remotePath) {
       const message = "缺少远端项目目录 remotePath。";
       if (options.apiMode) throw new Error(message);
@@ -527,7 +528,7 @@ async function createOrOpenProject(options = {}) {
     }
 
     const projectName = path.posix.basename(remotePath);
-    const localPath = String(options.localPath || path.join(target.localBase, projectName)).trim();
+    const localPath = localPathText(options.localPath || path.join(target.localBase, projectName), process.platform);
     const selectedTarget = { ...target.sftp, remotePath };
     await withHostOperationLease("create-workspace", "创建 SFTP 工作区", localPath, async () => {
       await confirmTransferPath({
@@ -587,8 +588,8 @@ function resolveCreateProjectTarget(server, cfg, options = {}) {
   const username = String(item.user || item.username || fallback.user || fallback.username || cfg.get("userName") || "").trim();
   const fallbackPort = normalizeSshPort(fallback.port || fallback.sshPort, normalizeSshPort(cfg.get("sshPort"), 22));
   const port = normalizeSshPort(item.sshPort || item.port, fallbackPort);
-  const remoteBase = String(item.remotePath || fallback.remoteBase || fallback.remotePath || cfg.get("remoteBase") || "").replace(/\/+$/, "");
-  const localBase = String(item.localBase || fallback.localBase || cfg.get("localBase") || "").trim();
+  const remoteBase = remotePathText(item.remotePath || fallback.remoteBase || fallback.remotePath || cfg.get("remoteBase"), process.platform);
+  const localBase = localPathText(item.localBase || fallback.localBase || cfg.get("localBase"), process.platform);
   const execHost = String(item.host || item.sshConfigHost || fallback.execHost || fallback.host || fallback.sshConfigHost || cfg.get("execHost") || host).trim();
   const label = String(item.id || item.label || fallback.id || fallback.label || host || "simple-sftp-target").trim();
   assertCreateProjectTarget({ host, remoteBase, localBase });
@@ -628,7 +629,7 @@ async function showCurrentTarget(options = {}) {
   const workspaceFolder = getPrimaryWorkspaceFolder();
   if (!workspaceFolder && !options.localPath) {
     if (options.apiMode && hasExplicitTarget) {
-      const localPath = String(options.localPath || "").trim();
+      const localPath = localPathText(options.localPath || "", process.platform);
       const sftp = localPath ? resolveUploadSftp(localPath, options) : apiTransferSftp({ ...options, localPath });
       if (sftp && sftp.host && sftp.remotePath) {
         const summary = formatSftpTargetSummary(localPath, sftp);
@@ -647,7 +648,7 @@ async function showCurrentTarget(options = {}) {
     if (!options.apiMode) vscode.window.showInformationMessage("当前未打开工作区。");
     return { ok: false, error: "当前未打开工作区。请传入 localPath。" };
   }
-  const localPath = String(options.localPath || getWorkspaceRoot()).trim();
+  const localPath = localPathText(options.localPath || getWorkspaceRoot(), process.platform);
   const sftp = hasExplicitTarget ? resolveUploadSftp(localPath, options) : readSftpConfig(localPath);
   if (!sftp || !sftp.remotePath || !sftp.host) {
     const message = hasExplicitTarget
@@ -682,7 +683,7 @@ function formatSftpTargetSummary(localPath, sftp) {
 }
 
 async function updateWorkspaceTarget(options = {}) {
-  const localPath = String(options.localPath || getWorkspaceRoot()).trim();
+  const localPath = localPathText(options.localPath || getWorkspaceRoot(), process.platform);
   if (!localPath)
     throw new Error("target.update 缺少本地工作区 localPath。");
   return withHostOperationLease("update-target", "更新 SFTP 工作区目标", localPath, () =>
@@ -691,7 +692,7 @@ async function updateWorkspaceTarget(options = {}) {
 }
 
 async function updateWorkspaceTargetCore(options = {}) {
-  const localPath = String(options.localPath || "").trim();
+  const localPath = localPathText(options.localPath || "", process.platform);
   if (!localPath)
     throw new Error("target.update 缺少本地工作区 localPath。");
   const patch = options.patch && typeof options.patch === "object" && !Array.isArray(options.patch)
@@ -699,7 +700,7 @@ async function updateWorkspaceTargetCore(options = {}) {
     : {};
   const existing = readSftpConfig(localPath) || {};
   const host = String(patch.host || patch.hostname || existing.host || "").trim();
-  const remotePath = String(patch.remotePath || existing.remotePath || "").trim().replace(/\/+$/, "");
+  const remotePath = remotePathText(patch.remotePath ?? existing.remotePath, process.platform);
   if (!host)
     throw new Error("target.update 缺少目标主机 host。");
   if (!remotePath)
@@ -744,7 +745,7 @@ async function maybePromptForHandoff() {
   if (!workspaceFolder) return;
 
   const localPath = getWorkspaceRoot();
-  const workspaceKey = localPath.toLowerCase();
+  const workspaceKey = process.platform === "win32" ? localPath.toLowerCase() : localPath;
   if (promptedWorkspaces.has(workspaceKey)) return;
   promptedWorkspaces.add(workspaceKey);
 
@@ -794,7 +795,7 @@ function directSyncTarget(value, label) {
   const item = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const host = String(item.host || "").trim();
   const username = String(item.user || item.username || "").trim();
-  const remotePath = String(item.remotePath || "").trim().replace(/\/+$/, "");
+  const remotePath = remotePathText(item.remotePath, process.platform);
   const port = normalizeSshPort(item.port || item.sshPort, 22);
   if (!/^[A-Za-z0-9._-]+$/.test(host) || !/^[A-Za-z0-9._-]+$/.test(username)) throw new Error(`${label} SSH 主机或用户名无效。`);
   if (!remotePath.startsWith("/") || remotePath === "/" || remotePath.split("/").includes("..")) throw new Error(`${label} 项目根目录不安全。`);
@@ -2039,7 +2040,7 @@ async function syncFromRemoteCore(options = {}) {
       return { ok: false, error: message };
     }
 
-    const localPath = String(options.localPath || getWorkspaceRoot()).trim();
+    const localPath = localPathText(options.localPath || getWorkspaceRoot(), process.platform);
     const hasTargetOptions = Boolean(options.server || options.remotePath || options.host);
     const sftp = hasTargetOptions ? resolveUploadSftp(localPath, options) : readSftpConfig(localPath);
     if (!sftp) {
@@ -2105,7 +2106,7 @@ async function markHandoffReady(options = {}) {
 async function markHandoffReadyCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
-    const localPath = String(options.localPath || getWorkspaceRoot() || "").trim();
+    const localPath = localPathText(options.localPath || getWorkspaceRoot() || "", process.platform);
     if (!workspaceFolder && !localPath) {
       const message = "请先打开 SimpleSFTP 工作区，或由调用方传入 localPath。";
       if (options.apiMode) throw new Error(message);
@@ -2381,7 +2382,7 @@ function resolveUploadSftp(localPath, options) {
     existing.host
   );
   const user = String(server.user || server.username || options.user || options.username || existing.username || "").trim();
-  const remotePath = requestedRemotePath(options) || String(sharedServer.remotePath || sharedServer.remoteBase || existing.remotePath || "").replace(/\/+$/, "");
+  const remotePath = remotePathText(requestedRemotePath(options) || sharedServer.remotePath || sharedServer.remoteBase || existing.remotePath, process.platform);
   const port = normalizeSshPort(server.sshPort || server.port || options.sshPort || options.port || existing.port, 22);
   const ignore = mergeIgnorePatterns(DEFAULT_IGNORES, FIXED_IGNORES);
   return {
@@ -2403,8 +2404,8 @@ function resolveUploadSftp(localPath, options) {
 
 function requestedRemotePath(options = {}) {
   const server = options.server && typeof options.server === "object" ? options.server : {};
-  const top = String(options.remotePath || options.remoteBase || "").trim().replace(/\/+$/, "");
-  const nested = String(server.remotePath || server.remoteBase || "").trim().replace(/\/+$/, "");
+  const top = remotePathText(options.remotePath ?? options.remoteBase, process.platform, true);
+  const nested = remotePathText(server.remotePath ?? server.remoteBase, process.platform, true);
   if (top && nested && top !== nested) {
     throw new Error(`远端目标冲突：请求 ${top}，服务器对象 ${nested}。已阻止传输。`);
   }
@@ -3173,7 +3174,7 @@ async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项�
         prompt: "输入远端项目根目录路径。",
         value: current,
       });
-      return manual ? manual.trim().replace(/\/+$/, "") : null;
+      return manual ? remotePathText(manual, process.platform) : null;
     }
     if (picked.kind === "dir") {
       current = `${current}/${picked.name}`;
@@ -3207,7 +3208,16 @@ function listRemoteDirs(sftp, remotePath) {
         reject(new Error(`列出远端目录失败：${stderr || error.message}`));
         return;
       }
-      resolve(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+      if (process.platform === "darwin") {
+        const names = stdout.split("\0").filter(Boolean);
+        try {
+          for (const name of names) {
+            if (name.includes("/")) throw new Error("远端目录列表包含无效的文件夹名称。");
+            remotePathText("/" + name, process.platform);
+          }
+          resolve(names);
+        } catch (error) { reject(error); }
+      } else resolve(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
     });
     const monitor = watchTransferProcess(child, reject, false);
     child.stdout?.on("data", monitor.receive);
@@ -3215,7 +3225,9 @@ function listRemoteDirs(sftp, remotePath) {
 }
 
 function createListRemoteDirsSshArgs(sftp, remotePath) {
-  const command = `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort`;
+  const command = process.platform === "darwin"
+    ? `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type d -printf '%f\\0' 2>/dev/null | sort -z`
+    : `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort`;
   return getSshArgs(sftp, command);
 }
 
@@ -3353,7 +3365,7 @@ function workspaceHostPathForUri(uri) {
 }
 
 function resolveLocalWorkspacePath(value, operation) {
-  const input = String(value || "").trim();
+  const input = localPathText(value, process.platform);
   const folder = getPrimaryWorkspaceFolder();
   if (!folder) return input;
   const location = workspaceLocationForFolder(folder);
@@ -3379,7 +3391,7 @@ function resolveLocalWorkspacePath(value, operation) {
 }
 
 function resolveUploadFilePath(value) {
-  const input = String(value || "").trim();
+  const input = localPathText(value, process.platform);
   const folder = getPrimaryWorkspaceFolder();
   if (!input || !folder) return input;
   const location = workspaceLocationForFolder(folder);
@@ -3611,11 +3623,11 @@ function persistTransferOperationLedger() {
 }
 
 function transferRequestKey(method, params) {
-  const localPath = String(params.localPath || params.localBase || params.workspacePath || "").trim().replace(/[\\/]+/g, "/");
+  const localPath = localPathText(params.localPath || params.localBase || params.workspacePath, process.platform).replace(/[\\/]+/g, "/");
   const identity = {
     method,
     localPath: process.platform === "win32" ? localPath.toLowerCase() : localPath,
-    remotePath: String(params.remotePath || "").trim(),
+    remotePath: remotePathText(params.remotePath, process.platform, true),
     targetId: params.targetId || params.serverId || "",
     host: params.host || "",
     server: params.server && { id: params.server.id, name: params.server.name, host: params.server.host, remotePath: params.server.remotePath, port: params.server.port, username: params.server.username },
@@ -4110,7 +4122,7 @@ function createLocalApiMethods() {
       return result;
     },
     "remote.listDirs": async (params = {}) => {
-      const remotePath = String(params.remotePath || "").trim();
+      const remotePath = remotePathText(params.remotePath, process.platform, true);
       if (!remotePath) throw new Error("缺少远端目录 remotePath。");
       const sftp = apiTransferSftp(params);
       sftp.remotePath = remotePath;
@@ -4129,7 +4141,7 @@ function createLocalApiMethods() {
       return showCurrentTarget({ ...params, apiMode: true });
     },
     "target.update": async (params = {}) => {
-      const localPath = String(params.localPath || getWorkspaceRoot() || "").trim();
+      const localPath = localPathText(params.localPath || getWorkspaceRoot() || "", process.platform);
       if (!localPath)
         throw new Error("target.update 缺少本地工作区 localPath。");
       const patch = params.patch && typeof params.patch === "object" && !Array.isArray(params.patch)
@@ -4141,7 +4153,7 @@ function createLocalApiMethods() {
         host: String(patch.host || sftp.host || "").trim(),
         port: normalizeSshPort(patch.port ?? patch.sshPort ?? sftp.port, 22),
         username: String(patch.username ?? patch.user ?? sftp.username ?? "").trim(),
-        remotePath: String(patch.remotePath || sftp.remotePath || "").trim().replace(/\/+$/, ""),
+        remotePath: remotePathText(patch.remotePath ?? sftp.remotePath, process.platform),
       };
       requireApiConfirmation(params, {
         method: "target.update",
@@ -4159,7 +4171,7 @@ function createLocalApiMethods() {
       return result;
     },
     "project.create": async (params = {}) => {
-      const remotePath = String(params.remotePath || "").trim();
+      const remotePath = remotePathText(params.remotePath, process.platform);
       if (!remotePath) throw new Error("缺少远端项目目录 remotePath。");
       const sftp = apiTransferSftp(params);
       sftp.remotePath = remotePath;
@@ -4178,7 +4190,7 @@ function createLocalApiMethods() {
       return result;
     },
     "sync.fromRemote": async (params = {}) => {
-      const localPath = String(params.localPath || "").trim();
+      const localPath = localPathText(params.localPath || "", process.platform);
       if (!localPath) throw new Error("缺少本地工作区 localPath。");
       const sftp = apiTransferSftp({ ...params, localPath });
       requireApiConfirmation(params, {
@@ -4196,7 +4208,7 @@ function createLocalApiMethods() {
       return result;
     },
     "sync.downloadPaths": async (params = {}) => {
-      const localPath = String(params.localPath || "").trim();
+      const localPath = localPathText(params.localPath || "", process.platform);
       if (!localPath) throw new Error("缺少本地项目目录 localPath。");
       if (!params.server || typeof params.server !== "object") throw new Error("必须明确指定来源 Worker。");
       const scope = explicitDownloadScope(params);
@@ -4213,7 +4225,7 @@ function createLocalApiMethods() {
       return result;
     },
     "sync.downloadMappedPaths": async (params = {}) => {
-      const localPath = String(params.localPath || "").trim();
+      const localPath = localPathText(params.localPath || "", process.platform);
       if (!localPath) throw new Error("缺少本地项目目录 localPath。");
       if (!params.server || typeof params.server !== "object") throw new Error("必须明确指定来源 Worker。");
       const plan = normalizeMappedDownloadEntries(params);
@@ -4310,7 +4322,7 @@ function createLocalApiMethods() {
       return { ok: true, transferId: id, operationId, cancelled: Boolean(targets.length || operation), status: operation?.status || "cancelling", settled: operation?.status === "settled" && operation.persisted === true, operationInstanceId: operation?.operationInstanceId || "", instanceId: currentTransferApiInstanceId() };
     },
     "upload.workspace": async (params = {}) => {
-      const localPath = String(params.localPath || "").trim();
+      const localPath = localPathText(params.localPath || "", process.platform);
       const sftp = resolveUploadSftp(localPath, params);
       requireApiConfirmation(params, {
         method: "upload.workspace",
@@ -4331,7 +4343,7 @@ function createLocalApiMethods() {
       if (!Array.isArray(params.files) && !params.manifest) {
         throw new Error("缺少上传文件列表 files 或 manifest。");
       }
-      const localBase = String(params.localBase || params.localPath || "").trim();
+      const localBase = localPathText(params.localBase || params.localPath || "", process.platform);
       const sftp = resolveUploadSftp(localBase, params);
       requireApiConfirmation(params, {
         method: "upload.files",
@@ -4349,7 +4361,7 @@ function createLocalApiMethods() {
       return result;
     },
     "handoff.markReady": async (params = {}) => {
-      const localPath = String(params.localPath || "").trim();
+      const localPath = localPathText(params.localPath || "", process.platform);
       if (!localPath) throw new Error("缺少本地工作区 localPath。");
       const sftp = readSftpConfig(localPath) || apiTransferSftp(params);
       requireApiConfirmation(params, {
@@ -4368,7 +4380,7 @@ function createLocalApiMethods() {
       return result;
     },
     "downloadScope.configure": async (params = {}) => {
-      const localPath = String(params.localPath || "").trim();
+      const localPath = localPathText(params.localPath || "", process.platform);
       const sftp = apiTransferSftp(params);
       requireApiConfirmation(params, {
         method: "downloadScope.configure",
@@ -4507,15 +4519,16 @@ function apiTransferSftp(params = {}) {
     incoming.sshPort || incoming.port || shared.sshPort || shared.port || merged.sshPort || merged.port,
     22
   );
-  const remotePath = String(
+  const remotePath = remotePathText(
     requestedRemotePath(params) ||
     shared.remotePath ||
     shared.remoteBase ||
     merged.remotePath ||
     merged.remoteBase ||
     active.remotePath ||
-    ""
-  ).replace(/\/+$/, "");
+    "",
+    process.platform, true
+  );
   return {
     name: String(incoming.id || incoming.label || shared.id || shared.label || merged.id || merged.label || host || "simple-sftp-target"),
     host,
@@ -4534,7 +4547,7 @@ function publicServerRecord(item) {
     host: firstNonEmpty(item.sftpHost, item.sshHost, item.host, item.sshConfigHost, item.sshConfigAlias),
     user: item.user || item.username || "",
     port: normalizeSshPort(item.sshPort || item.port, 22),
-    remotePath: String(item.remotePath || item.remoteBase || "").replace(/\/+$/, ""),
+    remotePath: remotePathText(item.remotePath || item.remoteBase, process.platform),
     sshConfigHost: item.sshConfigHost || item.sshConfigAlias || "",
     source: item.source || "",
     enabled: item.enabled !== false,
@@ -4573,6 +4586,8 @@ function validateSimpleSftpConfigValue(key, value) {
     throw new Error(`SimpleSFTP 配置 ${key} 不能小于 ${schema.minimum}`);
   if (Number.isFinite(schema.maximum) && typeof value === "number" && value > schema.maximum)
     throw new Error(`SimpleSFTP 配置 ${key} 不能大于 ${schema.maximum}`);
+  if (process.platform === "darwin" && key === "simpleSftpMac.remoteBase") return remotePathText(value, process.platform);
+  if (process.platform === "darwin" && key === "simpleSftpMac.localBase") return localPathText(value, process.platform);
   return value;
 }
 
@@ -4615,10 +4630,8 @@ function sanitizeServerProfile(input, existing = {}) {
     source: String(input.source || existing.source || "api").trim() || "api",
     sshPort,
     port: sshPort,
-    remotePath: String(input.remotePath ?? input.remoteBase ?? existing.remotePath ?? existing.remoteBase ?? "")
-      .trim()
-      .replace(/\/+$/, ""),
-    localBase: String(input.localBase ?? existing.localBase ?? "").trim(),
+    remotePath: remotePathText(input.remotePath ?? input.remoteBase ?? existing.remotePath ?? existing.remoteBase, process.platform),
+    localBase: localPathText(input.localBase ?? existing.localBase, process.platform),
     sshConfigHost: String(input.sshConfigHost ?? input.sshConfigAlias ?? existing.sshConfigHost ?? existing.sshConfigAlias ?? "").trim(),
     sshConfigAlias: String(input.sshConfigAlias ?? input.sshConfigHost ?? existing.sshConfigAlias ?? existing.sshConfigHost ?? "").trim(),
     sftpHost: String(input.sftpHost ?? existing.sftpHost ?? "").trim(),
@@ -4660,7 +4673,9 @@ function filesSummary(files) {
 function readSftpConfig(localPath) {
   const configPath = path.join(localPath, ".vscode", "sftp.json");
   if (!fs.existsSync(configPath)) return null;
-  return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  if (process.platform === "darwin") config.remotePath = remotePathText(config.remotePath, process.platform);
+  return config;
 }
 
 function patternMatchesPath(lowerPath, pattern) {
@@ -4820,7 +4835,7 @@ async function handleSavedDocument(document) {
 }
 
 function enqueueWorkspaceUpload(localPath, task) {
-  const key = localPath.toLowerCase();
+  const key = process.platform === "win32" ? localPath.toLowerCase() : localPath;
   const previous = uploadQueues.get(key) || Promise.resolve();
   const next = previous
     .catch(() => {})
@@ -5304,7 +5319,7 @@ async function downloadMappedPathsCore(options = {}) {
 }
 
 async function downloadMappedPathsInternal(options = {}) {
-  const localPath = String(options.localPath || "").trim();
+  const localPath = localPathText(options.localPath || "", process.platform);
   let plan = options.plan || normalizeMappedDownloadEntries(options);
   const sftp = options.sftp || apiTransferSftp({ ...options, localPath });
   if (!sftp || !sftp.host || !sftp.remotePath) throw new Error("未配置可用的 SFTP 远端路径。");

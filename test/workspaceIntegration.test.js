@@ -32,6 +32,7 @@ function remoteSandbox() {
   return {
     path,
     process: { platform: "win32" },
+    ...require("../workspace-path"),
     resolveWorkspaceLocation,
     vscode: {
       workspace: {

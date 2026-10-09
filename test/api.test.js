@@ -402,7 +402,7 @@ test("SimpleSFTP exposes the planned public API methods", () => {
 
 test("SimpleSFTP target and upload helpers support explicit servers without sftp.json", () => {
   assert.match(extensionSource, /function apiTransferSftp/);
-  assert.match(extensionSource, /requestedRemotePath\(options\) \|\| String\(sharedServer\.remotePath/);
+  assert.match(extensionSource, /remotePathText\(requestedRemotePath\(options\) \|\| sharedServer\.remotePath/);
   assert.match(extensionSource, /function resolveUploadSftp/);
   assert.match(extensionSource, /"target\.show": async[\s\S]{0,120}showCurrentTarget/);
   assert.match(extensionSource, /"upload\.workspace": async/);

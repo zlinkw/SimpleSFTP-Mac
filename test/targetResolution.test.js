@@ -31,6 +31,8 @@ function sandbox() {
     remotePath: "/data/qgking/zlk/MultiModal",
   };
   const context = {
+    process: { platform: "win32" },
+    ...require("../workspace-path"),
     DEFAULT_IGNORES: [],
     FIXED_IGNORES: [".git", ".vscode"],
     readSharedServers: () => ({ servers: [profile] }),

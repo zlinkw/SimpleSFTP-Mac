@@ -46,12 +46,24 @@ function resolveWorkspaceLocation(uri, config = {}) {
   return { scheme, editorUri, hostPath, relativePath, remote: true };
 }
 
-function normalizeMacAbsolutePath(value) {
-  const raw = String(value || "");
-  if (!raw.startsWith("/") || raw.startsWith("//") || /[\\\0\r\n]/.test(raw) || raw.split("/").some(part => part === "." || part === "..")) {
-    throw new Error("本地工作区路径必须是无越界路径段的 POSIX 绝对路径。");
+function normalizeMacAbsolutePath(value, label = "路径", allowRoot = false) {
+  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//")
+    || /[\x00-\x1f\x7f\\]/.test(value) || value.split("/").some(part => part === "." || part === "..")) {
+    throw new Error(`${label} 必须是无 . 或 ..、反斜杠或控制字符的单根绝对 POSIX 路径。`);
   }
-  return path.posix.normalize(raw);
+  const normalized = path.posix.normalize(value).replace(/\/+$/, "") || "/";
+  if (!allowRoot && normalized === "/") throw new Error(`${label} 不能使用根目录。`);
+  return normalized;
+}
+
+function localPathText(value, platform = process.platform) {
+  if (platform !== "darwin") return String(value || "").trim();
+  return value == null || value === "" ? "" : normalizeMacAbsolutePath(value, "本机路径");
+}
+
+function remotePathText(value, platform = process.platform, allowRoot = false) {
+  if (platform !== "darwin") return String(value || "").trim().replace(/\/+$/, "");
+  return value == null || value === "" ? "" : normalizeMacAbsolutePath(value, "远端路径", allowRoot);
 }
 
 function normalizeWindowsAbsolutePath(value, label) {
@@ -112,4 +124,4 @@ function isEscapingRelativePath(value, api) {
   return value === ".." || value.startsWith(`..${api.sep}`) || api.isAbsolute(value);
 }
 
-module.exports = { resolveWorkspaceLocation };
+module.exports = { resolveWorkspaceLocation, normalizeMacAbsolutePath, localPathText, remotePathText };
