@@ -303,14 +303,14 @@ test("CLI reads the SimpleSFTP discovery file", () => {
       token: "test-token",
       pid: 123,
     })}\n`, "utf8");
-    process.env.SIMPLE_SFTP_API_FILE = discoveryPath;
+    process.env.SIMPLE_SFTP_MAC_API_FILE = discoveryPath;
     const { readDiscovery } = require("../bin/simple-sftp-api.js");
     const discovery = readDiscovery();
     assert.equal(discovery.port, 19766);
     assert.equal(discovery.token, "test-token");
-    delete process.env.SIMPLE_SFTP_API_FILE;
+    delete process.env.SIMPLE_SFTP_MAC_API_FILE;
   } finally {
-    delete process.env.SIMPLE_SFTP_API_FILE;
+    delete process.env.SIMPLE_SFTP_MAC_API_FILE;
     fs.writeFileSync(path.join(root, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });
@@ -318,7 +318,7 @@ test("CLI reads the SimpleSFTP discovery file", () => {
 test("SimpleSFTP self-check reports missing discovery and listener", async () => {
   const missing = path.join(os.tmpdir(), `simple-sftp-self-check-${process.pid}-${Date.now()}.json`);
   const result = await runCli([path.join(__dirname, "../bin/simple-sftp-api.js"), "self-check"], {
-    SIMPLE_SFTP_API_FILE: missing,
+    SIMPLE_SFTP_MAC_API_FILE: missing,
   });
   assert.equal(result.code, 1, result.stderr || "");
   const parsed = JSON.parse(result.stdout);
@@ -332,7 +332,7 @@ test("SimpleSFTP self-check passes with live listener", async () => {
   const f = await startServer({});
   try {
     const result = await runCli([path.join(__dirname, "../bin/simple-sftp-api.js"), "self-check"], {
-      SIMPLE_SFTP_API_FILE: path.join(f.root, "api.json"),
+      SIMPLE_SFTP_MAC_API_FILE: path.join(f.root, "api.json"),
     });
     assert.equal(result.code, 0, result.stderr || "");
     const parsed = JSON.parse(result.stdout);
@@ -356,7 +356,7 @@ test("SimpleSFTP uploads have connect timeout, progress inactivity, cancellation
   assert.match(extensionSource, /defaultConnectTimeoutSeconds = 15/);
   assert.match(extensionSource, /"-o", `ConnectTimeout=\$\{connectTimeout\}`/);
   assert.match(extensionSource, /ProgressInactivity/);
-  assert.equal(require("../package.json").contributes.configuration.properties["simpleSftp.uploadTimeoutSeconds"].description.includes("不再限制业务总时长"), true);
+  assert.equal(require("../package.json").contributes.configuration.properties["simpleSftpMac.uploadTimeoutSeconds"].description.includes("不再限制业务总时长"), true);
   assert.match(extensionSource, /cancellable: uploadProgressCancellable/);
   assert.match(extensionSource, /transfer\.cancel\(/);
   assert.match(extensionSource, /"transfers\.list": async/);

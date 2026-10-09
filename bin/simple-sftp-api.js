@@ -6,15 +6,15 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 
-const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+const APPDATA = require("../mac-paths").applicationDataRoot();
 const discoveryPath =
-  process.env.SIMPLE_SFTP_API_FILE ||
-  path.join(APPDATA, "SimpleSFTP", "api.json");
+  process.env.SIMPLE_SFTP_MAC_API_FILE ||
+  path.join(APPDATA, "SimpleSFTPMac", "api.json");
 
 async function main(argv) {
   const [method, ...rest] = argv;
   if (!method || method.startsWith("-")) {
-    console.error("Usage: simple-sftp-api <method> --json <params.json>");
+    console.error("Usage: simple-sftp-mac-api <method> --json <params.json>");
     return 2;
   }
   if (method === "self-check") {

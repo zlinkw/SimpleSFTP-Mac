@@ -26,11 +26,11 @@ const {
   HostOperationLeaseManager,
 } = require("./host-operation-lease.js");
 const PACKAGE_JSON = require("./package.json");
-const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-const SHARED_SERVER_DIR = path.join(APPDATA, "SimpleSFTP", "server-profiles");
+const APPDATA = require("./mac-paths").applicationDataRoot();
+const SHARED_SERVER_DIR = path.join(APPDATA, "SimpleSFTPMac", "server-profiles");
 const SHARED_SERVER_FILE = path.join(SHARED_SERVER_DIR, "servers.json");
-const LEGACY_SHARED_SERVER_FILE = path.join(APPDATA, "ZLK", "server-profiles", "servers.json");
-const API_CONFIG_NAMESPACE = "simpleSftp";
+const LEGACY_SHARED_SERVER_FILE = path.join(APPDATA, "SimpleSFTPMac", "legacy-server-profiles", "servers.json");
+const API_CONFIG_NAMESPACE = "simpleSftpMac";
 const API_CONFIG_PREFIX = `${API_CONFIG_NAMESPACE}.`;
 const SIMPLE_SFTP_CONFIG_KEYS = new Set(Object.keys(PACKAGE_JSON.contributes?.configuration?.properties || {}));
 
@@ -164,43 +164,43 @@ function activate(context) {
   loadTransferOperationLedger();
   refreshConnectTimeoutFromConfig();
   const command = vscode.commands.registerCommand(
-    "simpleSftp.createOrOpen",
+    "simpleSftpMac.createOrOpen",
     (options) => createOrOpenProject(options)
   );
   const syncCommand = vscode.commands.registerCommand(
-    "simpleSftp.syncFromRemote",
+    "simpleSftpMac.syncFromRemote",
     () => syncFromRemote()
   );
   const uploadWorkspaceCommand = vscode.commands.registerCommand(
-    "simpleSftp.uploadWorkspace",
+    "simpleSftpMac.uploadWorkspace",
     (options) => uploadWorkspace(options)
   );
   const uploadFilesCommand = vscode.commands.registerCommand(
-    "simpleSftp.uploadFiles",
+    "simpleSftpMac.uploadFiles",
     (options) => uploadFiles(options)
   );
   const selectServerCommand = vscode.commands.registerCommand(
-    "simpleSftp.selectServer",
+    "simpleSftpMac.selectServer",
     () => selectServer()
   );
   const importSshConfigCommand = vscode.commands.registerCommand(
-    "simpleSftp.importSshConfig",
+    "simpleSftpMac.importSshConfig",
     () => importSharedSshConfig()
   );
   const openSharedServerConfigCommand = vscode.commands.registerCommand(
-    "simpleSftp.openSharedServerConfig",
+    "simpleSftpMac.openSharedServerConfig",
     () => openSharedServerConfig()
   );
   const showCurrentTargetCommand = vscode.commands.registerCommand(
-    "simpleSftp.showCurrentTarget",
+    "simpleSftpMac.showCurrentTarget",
     () => showCurrentTarget()
   );
   const handoffCommand = vscode.commands.registerCommand(
-    "simpleSftp.markHandoffReady",
+    "simpleSftpMac.markHandoffReady",
     () => markHandoffReady()
   );
   const configureDownloadScopeCommand = vscode.commands.registerCommand(
-    "simpleSftp.configureDownloadScope",
+    "simpleSftpMac.configureDownloadScope",
     (options) => configureDownloadScope(options)
   );
   context.subscriptions.push(command, syncCommand, uploadWorkspaceCommand, uploadFilesCommand, handoffCommand, configureDownloadScopeCommand, selectServerCommand, importSshConfigCommand, openSharedServerConfigCommand, showCurrentTargetCommand);
@@ -209,10 +209,10 @@ function activate(context) {
       void handleSavedDocument(document);
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("simpleSftp.connectTimeoutSeconds")) {
+      if (event.affectsConfiguration("simpleSftpMac.connectTimeoutSeconds")) {
         refreshConnectTimeoutFromConfig();
       }
-      if (event.affectsConfiguration("simpleSftp.uploadOnSave")) {
+      if (event.affectsConfiguration("simpleSftpMac.uploadOnSave")) {
         applyUploadOnSaveSettingToOpenWorkspaces();
       }
     })
@@ -220,7 +220,7 @@ function activate(context) {
 
   const actionsProvider = new ActionTreeProvider();
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider("simpleSftp.actions", actionsProvider)
+    vscode.window.registerTreeDataProvider("simpleSftpMac.actions", actionsProvider)
   );
 
   context.subscriptions.push(
@@ -228,25 +228,25 @@ function activate(context) {
     createStatusButton(
       "$(cloud-download) SimpleSFTP 项目",
       "选择远端项目并创建本地 SFTP 同步工作区。",
-      "simpleSftp.createOrOpen",
+      "simpleSftpMac.createOrOpen",
       102
     ),
     createStatusButton(
       "$(sync) 远端到本地",
       "从远端同步代码到当前本地工作区，适合开始编辑前使用。",
-      "simpleSftp.syncFromRemote",
+      "simpleSftpMac.syncFromRemote",
       101
     ),
     createStatusButton(
       "$(cloud-upload) 交接",
       "上传本地代码并写入交接标记，适合切换设备前使用。",
-      "simpleSftp.markHandoffReady",
+      "simpleSftpMac.markHandoffReady",
       100
     ),
     createStatusButton(
       "$(cloud-download) 下载范围",
       "选择允许从远端下载到本机的文件和文件夹。",
-      "simpleSftp.configureDownloadScope",
+      "simpleSftpMac.configureDownloadScope",
       99
     )
   );
@@ -266,7 +266,7 @@ function startLocalApiServer(context) {
     name: "SimpleSFTP",
     version: String(PACKAGE_JSON.version || "0.2.0"),
     preferredPort: 19766,
-    discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
+    discoveryPath: path.join(APPDATA, "SimpleSFTPMac", "api.json"),
     methods: createLocalApiMethods(),
     methodOptions: {
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
@@ -303,7 +303,7 @@ function createServerStatusButton() {
     vscode.StatusBarAlignment.Left,
     103
   );
-  serverStatusButton.command = "simpleSftp.selectServer";
+  serverStatusButton.command = "simpleSftpMac.selectServer";
   serverStatusButton.tooltip = "选择共享服务器配置。";
   serverStatusButton.show();
   return serverStatusButton;
@@ -453,31 +453,31 @@ class ActionTreeProvider {
         label: "创建或打开项目",
         description: "选择远端项目目录并创建本地工作区",
         icon: "cloud-download",
-        command: "simpleSftp.createOrOpen",
+        command: "simpleSftpMac.createOrOpen",
       }),
       new ActionTreeItem({
         label: "远端同步到本地",
         description: "开始编辑前同步远端代码",
         icon: "sync",
-        command: "simpleSftp.syncFromRemote",
+        command: "simpleSftpMac.syncFromRemote",
       }),
       new ActionTreeItem({
         label: "上传并标记交接",
         description: "切换设备前上传并写入交接标记",
         icon: "cloud-upload",
-        command: "simpleSftp.markHandoffReady",
+        command: "simpleSftpMac.markHandoffReady",
       }),
       new ActionTreeItem({
         label: "设置下载文件范围",
         description: "选择允许下载的远端文件和文件夹",
         icon: "cloud-download",
-        command: "simpleSftp.configureDownloadScope",
+        command: "simpleSftpMac.configureDownloadScope",
       }),
       new ActionTreeItem({
         label: "查看当前目标",
         description: "查看当前 SFTP 工作区映射",
         icon: "info",
-        command: "simpleSftp.showCurrentTarget",
+        command: "simpleSftpMac.showCurrentTarget",
       }),
     ];
   }
@@ -498,7 +498,7 @@ class ActionTreeItem extends vscode.TreeItem {
 
 async function createOrOpenProject(options = {}) {
   try {
-    const cfg = vscode.workspace.getConfiguration("simpleSftp");
+    const cfg = vscode.workspace.getConfiguration("simpleSftpMac");
     const target = resolveCreateProjectTarget(getActiveSharedServer(), cfg, options);
     const writeAgentsFile = cfg.get("writeAgentsFile");
 
@@ -722,7 +722,7 @@ async function updateWorkspaceTargetCore(options = {}) {
 }
 
 async function maybePromptForHandoff() {
-  const cfg = vscode.workspace.getConfiguration("simpleSftp");
+  const cfg = vscode.workspace.getConfiguration("simpleSftpMac");
   if (!cfg.get("handoffPrompt")) return;
 
   const workspaceFolder = getPrimaryWorkspaceFolder();
@@ -2000,7 +2000,7 @@ async function syncFromRemoteCore(options = {}) {
 
     await confirmTransferPath({ localPath, sftp, operation: "远端同步到本地", detail: "远端项目文件覆盖到当前工作区", options });
 
-    const cfg = vscode.workspace.getConfiguration("simpleSftp");
+    const cfg = vscode.workspace.getConfiguration("simpleSftpMac");
     const markerName = cfg.get("handoffMarkerName") || DEFAULT_HANDOFF_MARKER;
     const marker = await readRemoteHandoffMarker(sftp, markerName).catch(() => null);
     if (!options.apiMode && options.confirmMarker !== false && marker) {
@@ -2101,7 +2101,7 @@ async function markHandoffReadyCore(options = {}) {
       uploadMode: uploadRequested ? "all" : "none",
     };
 
-    const cfg = vscode.workspace.getConfiguration("simpleSftp");
+    const cfg = vscode.workspace.getConfiguration("simpleSftpMac");
     const markerName = cfg.get("handoffMarkerName") || DEFAULT_HANDOFF_MARKER;
     await writeRemoteHandoffMarker(sftp, markerName, marker);
     writeLocalSessionRecord(localPath, {
@@ -3219,7 +3219,7 @@ function getPrimaryWorkspaceFolder() {
 }
 
 function workspaceMappingConfig() {
-  const cfg = vscode.workspace.getConfiguration("simpleSftp");
+  const cfg = vscode.workspace.getConfiguration("simpleSftpMac");
   return {
     hostRoot: cfg.get("workspaceHostRoot") || "",
     containerRoot: cfg.get("workspaceContainerRoot") || "",
@@ -3253,7 +3253,7 @@ async function withFileResourceLease(operation, project, paths, server, work) {
   const resources = (paths.length ? paths : [targetProject]).map(target => ({
     server, project: targetProject, target: server === "local" ? path.resolve(targetProject, target) : (target.startsWith("/") ? target : targetProject + "/" + target),
   }));
-  return hostOperationLease.run({ pluginId: "simple-local.simple-sftp", workspaceUri: "file://" + targetProject,
+  return hostOperationLease.run({ pluginId: "simple-local.simple-sftp-mac", workspaceUri: "file://" + targetProject,
     hostProjectPath: targetProject, actionType: operation, actionLabel: operation, resources }, work);
 }
 function remoteResourceServer(sftp) { return String(sftp.host).toLowerCase() + ":" + normalizeSshPort(sftp.port, 22); }
@@ -3270,7 +3270,7 @@ async function withHostOperationLease(actionType, actionLabel, localPath, operat
   const workspaceUri = String(location && location.editorUri || folder && folder.uri && folder.uri.toString?.(true) || "untitled://simple-sftp/no-workspace");
   try {
     return await hostOperationLease.run({
-      pluginId: "simple-local.simple-sftp",
+      pluginId: "simple-local.simple-sftp-mac",
       workspaceUri,
       hostProjectPath,
       actionType,
@@ -3364,7 +3364,7 @@ function transferPathConfirmationKey(localPath, sftp) {
 }
 
 function refreshConnectTimeoutFromConfig() {
-  const value = Number(vscode.workspace.getConfiguration("simpleSftp").get("connectTimeoutSeconds", 15));
+  const value = Number(vscode.workspace.getConfiguration("simpleSftpMac").get("connectTimeoutSeconds", 15));
   defaultConnectTimeoutSeconds = Number.isFinite(value) && value >= 0
     ? Math.min(Math.max(0, Math.floor(value)), 3600)
     : 15;
@@ -3760,7 +3760,7 @@ async function reconcileTransferOperationCore(params) {
     signal?.throwIfAborted();
     handle = transferRecoveryTestHooks?.acquire
       ? await transferRecoveryTestHooks.acquire(resources)
-      : await hostOperationLease.acquire({ pluginId: "simple-local.simple-sftp", workspaceUri: "file://" + destination.remotePath,
+      : await hostOperationLease.acquire({ pluginId: "simple-local.simple-sftp-mac", workspaceUri: "file://" + destination.remotePath,
         hostProjectPath: destination.remotePath, actionType: "transfer-reconcile", actionLabel: "核实旧传输退出", resources });
     await handle.assertHeld();
     const localProof = transferRecoveryTestHooks?.localProof || localTransferExitProof;
@@ -3808,7 +3808,7 @@ function transferTimeoutMs(sftp, options = {}) { return 120000; }
 
 function uploadProgressCancellable(options = {}) {
   if (options && typeof options.cancellable === "boolean") return options.cancellable;
-  return vscode.workspace.getConfiguration("simpleSftp").get("uploadCancellable", true) !== false;
+  return vscode.workspace.getConfiguration("simpleSftpMac").get("uploadCancellable", true) !== false;
 }
 
 function runUploadWithProgress(options, title, operation) {
@@ -4743,7 +4743,7 @@ function runSsh(sftp, command, timeout) {
 async function handleSavedDocument(document) {
   if (!document || !["file", "vscode-remote"].includes(document.uri.scheme)) return;
 
-  const cfg = vscode.workspace.getConfiguration("simpleSftp");
+  const cfg = vscode.workspace.getConfiguration("simpleSftpMac");
   if (!cfg.get("uploadOnSave")) return;
 
   let documentHostPath;
