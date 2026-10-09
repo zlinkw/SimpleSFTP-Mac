@@ -123,23 +123,23 @@
 					"type": "string",
 					"default": "",
 					"scope": "application",
-					"description": "可选 Windows 宿主工作区根目录。仅用于将 Dev Container 工作区映射到 UI Extension Host；普通 Windows 工作区无需配置。"
+					"description": "Mac 首版使用本机 file 工作区，此项保持空值；Dev Containers 不在首版支持范围。"
 				},
 				"simpleSftpMac.workspaceContainerRoot": {
 					"type": "string",
 					"default": "",
 					"scope": "application",
-					"description": "可选 Dev Container 工作区根目录，例如 /workspaces。远程工作区上传下载必须同时配置宿主根。"
+					"description": "Mac 首版不支持 Dev Containers，此项保持空值。"
 				},
 				"simpleSftpMac.remoteBase": {
 					"type": "string",
 					"default": "",
-					"description": "用于选择项目的远端根目录。"
+					"description": "用于选择项目的 Linux 远端项目父目录，填写用户实际配置的绝对 POSIX 路径。"
 				},
 				"simpleSftpMac.localBase": {
 					"type": "string",
 					"default": "",
-					"description": "创建同步项目时使用的本地根目录。"
+					"description": "创建同步项目时使用的 Mac 本机父目录，例如 /Users/实际用户名/Projects；使用绝对路径，不填 ~ 或 $HOME。"
 				},
 				"simpleSftpMac.sshHost": {
 					"type": "string",

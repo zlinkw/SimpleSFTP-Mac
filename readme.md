@@ -38,6 +38,38 @@ SimpleSFTP 的检查入口会激活 SimpleExperiment Mac 并检查两个插件�
 
 ## 文件传输使用说明
 
+### Mac 上先配置目标
+
+1. VS Code 菜单 **File → Open Folder…** 打开本机项目；一个窗口只打开一个项目。
+2. 按 **⌘,** 搜索 `simpleSftpMac`。`localBase` 填本机项目父目录，例如 `/Users/实际用户名/Projects`；`remoteBase` 填真实 Linux 项目父目录。初次接入可将 `uploadOnSave` 关闭，先检查目标再手动上传。`workspaceHostRoot` 与 `workspaceContainerRoot` 留空。
+3. 按 **⇧⌘P → SimpleSFTP：打开共享服务器配置**。下面示例中的主机、用户名、端口和路径均需替换；多个服务器各有唯一 `id`：
+
+```json
+{
+  "version": 1,
+  "activeServerId": "worker-a",
+  "servers": [
+    {
+      "id": "worker-a",
+      "label": "Worker A",
+      "host": "你自己的 SSH 主机名或别名",
+      "user": "远端实际用户名",
+      "sshPort": 22,
+      "remotePath": "/data/你的实验父目录",
+      "localBase": "/Users/实际用户名/Projects",
+      "enabled": true
+    }
+  ]
+}
+```
+
+4. 保存后运行 **SimpleSFTP：选择服务器**，然后 **SimpleSFTP：查看当前目标**，核对账号、SSH 端口及完整路径。`sshPort` 填服务器 SSH 端口，不能填 Agent HTTP 转发端口。
+5. 已有本机 `~/.ssh/config` 时，可运行 **SimpleSFTP：导入 VS Code SSH 配置** 导入主机描述；不会读取 Termius 私有会话。当前传输依赖系统 SSH 配置，独立认证入口仍在适配，选择或导入配置不表示认证测试通过。
+
+设置中的路径使用绝对 POSIX 路径，不填盘符、`~`、`$HOME` 或未替换的用户名。保留中文、空格与大小写，终端中的路径有空格时加引号。完整的本机配置、Termius 手动转发及三拓扑接入约定见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md)，配套面板顶部 **配置说明** 也可打开。
+
+### 上传、下载与认证边界
+
 业务适配完成后的操作流程：打开本地项目 → 选择服务器与用户配置的远端目录 → 核对本机路径、账号、端口及完整目标路径 → 上传或下载。SimpleExperiment Mac 负责调度，SimpleSFTP Mac 负责真实传输。
 
 保留命令：**创建或打开远端项目**、**选择服务器**、**查看当前目标**、**上传工作区到目标**、**上传指定文件到目标**、**远端同步到本地**、**设置下载文件范围**、**上传并标记交接**。设置命名空间为 `simpleSftpMac.*`。
