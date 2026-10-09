@@ -102,7 +102,7 @@ test("all host file side effects acquire the shared operation lease", () => {
     assert.match(extractFunction(name), /withHostOperationLease\(/, `${name} missing host operation lease`);
   }
   assert.doesNotMatch(source, /configureIgnores|配置忽略规则/);
-  assert.match(source, /pluginId: "simple-local\.simple-sftp"/);
+  assert.match(source, /pluginId: "simple-local\.simple-sftp-mac"/);
   assert.match(source, /showErrorMessage\(error\.message, \{ modal: true \}, "知道了"\)/);
 });
 
@@ -112,4 +112,21 @@ test("remote saves and workspace configuration use mapped host paths", () => {
   assert.match(source, /documentHostPath = workspaceHostPathForUri\(document\.uri\)/);
   assert.match(source, /vscode\.Uri\.joinPath\(folder\.uri, \.\.\.normalized\.split\("\/"\)\)/);
   assert.match(source, /process\.platform !== "win32"/);
+});
+
+test('Mac UI host acquires resource leases and preserves case in workspace matching', async () => {
+ const folders=['/Users/test/研究 项目/Model','/Users/test/研究 项目/model'].map(p=>({uri:{scheme:'file',path:p,fsPath:p,toString:()=>p}}));
+ const calls=[];
+ const sandbox={path,process:{platform:'darwin',arch:'arm64'},resolveWorkspaceLocation,
+   normalizeSshPort:value=>Number(value),transferContext:{getStore:()=>null},require:name=>{assert.equal(name,'./mac-update-gate');return{assertBusinessAllowed(){calls.push('gate');}};},
+   hostOperationLease:{run:async(spec,work)=>{calls.push(spec);return work();}},
+   vscode:{workspace:{workspaceFolders:folders,getConfiguration:()=>({get:()=>''})}}};
+ vm.createContext(sandbox);
+ vm.runInContext(['getPrimaryWorkspaceFolder','workspaceMappingConfig','workspaceLocationForFolder','getWorkspaceRoot','getWorkspaceFolderForFile','transferPathConfirmationKey','withFileResourceLease'].map(extractFunction).join('\n')+'\nthis.api={getWorkspaceFolderForFile,transferPathConfirmationKey,withFileResourceLease};',sandbox);
+ assert.equal(sandbox.api.getWorkspaceFolderForFile('/Users/test/研究 项目/model/a.txt'),folders[1]);
+ assert.equal(sandbox.api.getWorkspaceFolderForFile('/Users/test/研究 项目/MODEL/a.txt'),null);
+ const server={host:'example',port:22,remotePath:'/data/project'};
+ assert.notEqual(sandbox.api.transferPathConfirmationKey(folders[0].uri.path,server),sandbox.api.transferPathConfirmationKey(folders[1].uri.path,server));
+ const value=await sandbox.api.withFileResourceLease('upload','/data/project',['研究 文件.txt'],'example:22',async()=>42);
+ assert.equal(value,42);assert.equal(calls[0],'gate');assert.equal(calls[1].resources[0].target,'/data/project/研究 文件.txt');
 });

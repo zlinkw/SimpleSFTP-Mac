@@ -3,23 +3,26 @@ const path = require("path");
 function resolveWorkspaceLocation(uri, config = {}) {
   const scheme = String(uri && uri.scheme || "").trim().toLowerCase();
   const editorUri = String(uri && uri.external || `${scheme}:${String(uri && uri.path || "")}`);
+  const platform = config.platform || process.platform;
   if (scheme === "file") {
-    const hostPath = normalizeWindowsAbsolutePath(uri && uri.fsPath, "本地工作区路径");
+    const hostPath = platform === "darwin" ? normalizeMacAbsolutePath(uri && uri.fsPath) : normalizeWindowsAbsolutePath(uri && uri.fsPath, "本地工作区路径");
     return { scheme, editorUri, hostPath, relativePath: "", remote: false };
   }
+
+  if (platform === "darwin") throw new Error("Mac 首版仅支持本地 file 工作区；Dev Containers 不在验收范围。");
 
   const remoteScheme = String(config.remoteScheme || "vscode-remote").trim().toLowerCase();
   if (scheme !== remoteScheme) {
     throw new Error(`不支持的工作区 URI scheme：${scheme || "<empty>"}`);
   }
   if (!String(config.hostRoot || "").trim()) {
-    throw new Error("远程工作区缺少配置 simpleSftp.workspaceHostRoot。");
+    throw new Error("远程工作区缺少配置 simpleSftpMac.workspaceHostRoot。");
   }
   if (!String(config.containerRoot || "").trim()) {
-    throw new Error("远程工作区缺少配置 simpleSftp.workspaceContainerRoot。");
+    throw new Error("远程工作区缺少配置 simpleSftpMac.workspaceContainerRoot。");
   }
 
-  const hostRoot = normalizeWindowsAbsolutePath(config.hostRoot, "simpleSftp.workspaceHostRoot");
+  const hostRoot = normalizeWindowsAbsolutePath(config.hostRoot, "simpleSftpMac.workspaceHostRoot");
   const containerRoot = normalizeContainerRoot(config.containerRoot);
   const containerPath = normalizeContainerPath(uri && uri.path, "远程工作区路径");
   if (containerPath !== containerRoot && !containerPath.startsWith(`${containerRoot}/`)) {
@@ -43,6 +46,14 @@ function resolveWorkspaceLocation(uri, config = {}) {
   return { scheme, editorUri, hostPath, relativePath, remote: true };
 }
 
+function normalizeMacAbsolutePath(value) {
+  const raw = String(value || "");
+  if (!raw.startsWith("/") || raw.startsWith("//") || /[\\\0\r\n]/.test(raw) || raw.split("/").some(part => part === "." || part === "..")) {
+    throw new Error("本地工作区路径必须是无越界路径段的 POSIX 绝对路径。");
+  }
+  return path.posix.normalize(raw);
+}
+
 function normalizeWindowsAbsolutePath(value, label) {
   const raw = String(value || "").trim();
   if (!/^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\")) {
@@ -52,7 +63,7 @@ function normalizeWindowsAbsolutePath(value, label) {
 }
 
 function normalizeContainerRoot(value) {
-  const root = normalizeContainerPath(value, "simpleSftp.workspaceContainerRoot");
+  const root = normalizeContainerPath(value, "simpleSftpMac.workspaceContainerRoot");
   return root === "/" ? root : root.replace(/\/+$/, "");
 }
 

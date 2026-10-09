@@ -3224,6 +3224,7 @@ function workspaceMappingConfig() {
     hostRoot: cfg.get("workspaceHostRoot") || "",
     containerRoot: cfg.get("workspaceContainerRoot") || "",
     remoteScheme: "vscode-remote",
+    platform: process.platform,
   };
 }
 
@@ -3249,7 +3250,7 @@ function getWorkspaceRoot(folder = getPrimaryWorkspaceFolder()) {
 
 async function withFileResourceLease(operation, project, paths, server, work) {
   if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
-  if (process.platform !== "win32") throw new Error("SimpleSFTP 文件副作用必须由 Windows UI Extension Host 执行。");
+  if (process.platform !== "win32" && !(process.platform === "darwin" && process.arch === "arm64")) throw new Error("SimpleSFTP 文件副作用必须由受支持的本地 UI Extension Host 执行。");
   const targetProject = server === "local" ? path.resolve(project) : String(project).replace(/\/+$/, "");
   const resources = (paths.length ? paths : [targetProject]).map(target => ({
     server, project: targetProject, target: server === "local" ? path.resolve(targetProject, target) : (target.startsWith("/") ? target : targetProject + "/" + target),
@@ -3261,8 +3262,8 @@ function remoteResourceServer(sftp) { return String(sftp.host).toLowerCase() + "
 
 async function withHostOperationLease(actionType, actionLabel, localPath, operation) {
   if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
-  if (process.platform !== "win32") {
-    throw new Error("SimpleSFTP 文件副作用必须由 Windows UI Extension Host 执行。");
+  if (process.platform !== "win32" && !(process.platform === "darwin" && process.arch === "arm64")) {
+    throw new Error("SimpleSFTP 文件副作用必须由受支持的本地 UI Extension Host 执行。");
   }
   if (/^(upload-|download-|sync-from-remote|mark-handoff-ready)/.test(actionType)) return operation();
   const folders = Array.isArray(vscode.workspace.workspaceFolders) ? vscode.workspace.workspaceFolders : [];
@@ -3358,7 +3359,7 @@ async function openWorkspaceRelativeFile(relativePath) {
 }
 
 function transferPathConfirmationKey(localPath, sftp) {
-  const local = path.win32.normalize(String(localPath || "")).toLowerCase();
+  const local = process.platform === "win32" ? path.win32.normalize(String(localPath || "")).toLowerCase() : path.posix.normalize(String(localPath || ""));
   const remote = String(sftp && sftp.remotePath || "").replace(/\/+$/, "");
   const host = String(sftp && sftp.host || "").trim().toLowerCase();
   const port = normalizeSshPort(sftp && sftp.port, 22);
@@ -5076,11 +5077,13 @@ function disableExternalUploadOnSave(localPath) {
 
 function getWorkspaceFolderForFile(filePath) {
   const folders = vscode.workspace.workspaceFolders || [];
-  const normalizedFile = path.win32.normalize(filePath).toLowerCase();
+  const api = process.platform === "win32" ? path.win32 : path.posix;
+  const normalize = value => process.platform === "win32" ? api.normalize(value).toLowerCase() : api.normalize(value);
+  const normalizedFile = normalize(filePath);
   return folders
     .map((folder) => {
       try {
-        return { folder, normalizedPath: path.win32.normalize(getWorkspaceRoot(folder)).toLowerCase() };
+        return { folder, normalizedPath: normalize(getWorkspaceRoot(folder)) };
       } catch {
         return null;
       }
@@ -5088,7 +5091,7 @@ function getWorkspaceFolderForFile(filePath) {
     .filter(Boolean)
     .filter(({ normalizedPath }) => (
       normalizedFile === normalizedPath ||
-      normalizedFile.startsWith(`${normalizedPath}${path.win32.sep}`)
+      normalizedFile.startsWith(`${normalizedPath}${api.sep}`)
     ))
     .sort((a, b) => b.normalizedPath.length - a.normalizedPath.length)
     .map(({ folder }) => folder)[0] || null;
