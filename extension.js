@@ -6485,6 +6485,9 @@ async function withTransferCapacity(options, work) {
 }
 
 module.exports = {
+  waitForUpdateIdle: async () => {
+    while (activeTransfers.size || activeTransferResources.size || activeUploadOperations.size || uploadQueues.size) await new Promise(resolve => setTimeout(resolve, 250));
+  },
   activate,
   deactivate,
   __test: {
