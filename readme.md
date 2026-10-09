@@ -125,6 +125,8 @@ CLI 为 `simple-sftp-mac-api`，保留原 npm 入口。VSIX 在受支持 Mac 激
 
 CLI 业务 RPC 自动读取当前 Mac 发现文件和 `/api/v1/capabilities`，核对实时方法、身份与版本后发送原参数。未知方法、监听变化、非本机地址和错误 HTTP/JSON 响应会停止本次调用；不会自动重试传输或补上 `confirm`、`pathConfirmed`。出现预检失败时，打开对应 VS Code 扩展并重新自检，再核对实时契约主动调用。自行调用 HTTP API 时仍需自行发现与查询契约；此预检通过本地监听和真实 CLI 测试，真实传输/M5 尚待验收。
 
+科研 Plan 通过配套 `simpleex-mac experiment run` 申请标准路线，SimpleSFTP 保持传输职责。CLI 与 VS Code 的项目必须一致，在线路线检查通过后仍需 VS Code 人工确认；`requested: true`、`submitted: false`、`waiting_confirmation` 是等待确认回执，使用返回的 `operationId` 与实时 `operations.list` 查看后续状态。[Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md) 提供完整路径与预检示例；离线 `local_only` 不能作为科研就绪证明。
+
 ## 发布与验收
 
 两仓验证、提交并同步 origin/master 后，在 SimpleExperiment-Mac 执行 `npm run release:prepare`、`npm run release:publish`。release.json 绑定两仓提交，核验全部附件后发布，已发布版本不可覆盖。不使用 GitHub Actions，不自动安装开发机扩展。
