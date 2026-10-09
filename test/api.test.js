@@ -413,7 +413,9 @@ test("SimpleSFTP target and upload helpers support explicit servers without sftp
 test("SimpleSFTP showCurrentTarget uses explicit server + remotePath", () => {
   assert.match(extensionSource, /async function showCurrentTarget[\s\S]{0,700}apiTransferSftp/);
   assert.match(extensionSource, /hasExplicitTarget = Boolean/);
-  assert.match(extensionSource, /module\.exports[\s\S]{0,200}apiTransferSftp/);
+  const Module = require("node:module"), original = Module._load;
+  Module._load = function(name, ...args) { return name === "vscode" ? { TreeItem: class {} } : original.call(this, name, ...args); };
+  try { assert.equal(typeof require("../extension").__test.apiTransferSftp, "function"); } finally { Module._load = original; }
 });
 
 test("SimpleSFTP config and server API helpers are defined and validate types", () => {
