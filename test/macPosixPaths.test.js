@@ -51,14 +51,23 @@ function fixture(listOutput = " 研究 A \0Model\0model\0") {
 }
 
 test("Mac absolute paths follow Experiment's rule without decoding or folding names", () => {
-  const experiment = localRequire(path.resolve(root, "../SimpleExperiment-Mac/dist/mac/PosixPath.js"));
-  const values = ["/Data/研究 / 实验 A ", "/Data/model", "/data/Model", "/tmp/literal%2f%20 ", "/Data/e\u0301", "/Data/é", "/Data//研究///", "/", "//host/share", "relative", "C:/work", "/Data/./x", "/Data/../x", "/Data/a\\b", "/Data/a\t", "/Data/a\0", "/Data/a\x7f", 42, null];
-  for (const allowRoot of [false, true]) for (const value of values) {
-    let expected;
-    try { expected = experiment.normalizePosixAbsolutePath(value, "路径", allowRoot); }
-    catch { assert.throws(() => paths.normalizeMacAbsolutePath(value, "路径", allowRoot)); continue; }
-    assert.equal(paths.normalizeMacAbsolutePath(value, "路径", allowRoot), expected);
+  const experimentFile = path.resolve(root, "../SimpleExperiment-Mac/dist/mac/PosixPath.js");
+  const experiment = fs.existsSync(experimentFile) ? localRequire(experimentFile) : null;
+  const valid = new Map(["/Data/研究 / 实验 A ", "/Data/model", "/data/Model", "/tmp/literal%2f%20 ", "/Data/e\u0301", "/Data/é"].map(value => [value, value]));
+  valid.set("/Data//研究///", "/Data/研究");
+  const invalid = ["//host/share", "relative", "C:/work", "/Data/./x", "/Data/../x", "/Data/a\\b", "/Data/a\t", "/Data/a\0", "/Data/a\x7f", 42, null];
+  for (const allowRoot of [false, true]) {
+    for (const [value, expected] of valid) {
+      assert.equal(paths.normalizeMacAbsolutePath(value, "路径", allowRoot), expected);
+      if (experiment) assert.equal(experiment.normalizePosixAbsolutePath(value, "路径", allowRoot), expected);
+    }
+    for (const value of invalid) {
+      assert.throws(() => paths.normalizeMacAbsolutePath(value, "路径", allowRoot));
+      if (experiment) assert.throws(() => experiment.normalizePosixAbsolutePath(value, "路径", allowRoot));
+    }
   }
+  assert.throws(() => paths.normalizeMacAbsolutePath("/"));
+  assert.equal(paths.normalizeMacAbsolutePath("/", "路径", true), "/");
   assert.equal(paths.localPathText("", "darwin"), "");
   assert.equal(paths.remotePathText(undefined, "darwin"), "");
 });
