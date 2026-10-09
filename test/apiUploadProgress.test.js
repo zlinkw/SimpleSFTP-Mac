@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+const runtimeRequire = require("node:module").createRequire(path.join(__dirname, "../extension.js"));
 
 const source = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
 const start = source.indexOf("function runUploadWithProgress(");
@@ -13,6 +14,7 @@ assert.ok(start >= 0 && end > start);
 function createRunner() {
   let progressCalls = 0;
   const sandbox = {
+    require: runtimeRequire,
     vscode: {
       ProgressLocation: { Notification: 15 },
       window: {
@@ -59,7 +61,7 @@ test('disconnected read removes its capacity ticket without touching the active 
   const active = pool.run(['worker:22'], undefined, () => new Promise(resolve => { release = resolve; }));
   const start = source.indexOf('async function withTransferCapacity('), end = source.indexOf('module.exports =', start);
   assert.ok(start >= 0 && end > start);
-  const sandbox = { AbortController, Error, String, transferContext: { getStore: () => undefined },
+  const sandbox = { require: runtimeRequire, AbortController, Error, String, transferContext: { getStore: () => undefined },
     currentApiRequestContext: () => ({ readOnly: true, signal: controller.signal }),
     transferCapacity: pool, normalizeSshPort: (_port, fallback) => fallback, waitLocalTransferResources: async () => {} };
   vm.createContext(sandbox);
@@ -97,7 +99,7 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
     classifyTransportFailure: (error) => error,
     appendProcessOutput: () => "",
     writeTarEntriesToStream: () => new Promise(() => {}),
-    spawn: () => {
+    spawnSsh: () => {
       child = new EventEmitter();
       child.stdin = new EventEmitter();
       child.stdin.end = () => {};

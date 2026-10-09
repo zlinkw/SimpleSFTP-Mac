@@ -38,7 +38,10 @@
 		"LICENSE.txt",
 		"mac-paths.js",
 		"mac-bootstrap.js",
-		"mac-update-gate.js"
+		"mac-update-gate.js",
+		"mac-auth.js",
+		"mac-ssh-askpass.js",
+		"mac-ssh-askpass.sh"
 	],
 	"engines": {
 		"vscode": "^1.80.0"
@@ -58,7 +61,8 @@
 		"onCommand:simpleSftpMac.uploadWorkspace",
 		"onCommand:simpleSftpMac.uploadFiles",
 		"onCommand:simpleSftpMac.markHandoffReady",
-		"onCommand:simpleSftpMac.configureDownloadScope"
+		"onCommand:simpleSftpMac.configureDownloadScope",
+		"onCommand:simpleSftpMac.configureAuthentication"
 	],
 	"main": "./mac-bootstrap.js",
 	"contributes": {
@@ -106,6 +110,10 @@
 			{
 				"command": "simpleSftpMac.checkPreviewUpdates",
 				"title": "SimpleSFTP Mac：检查 preview 配套更新"
+			},
+			{
+				"command": "simpleSftpMac.configureAuthentication",
+				"title": "SimpleSFTP Mac：配置服务器认证"
 			}
 		],
 		"views": {

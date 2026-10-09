@@ -26,6 +26,8 @@ const {
   HostOperationLeaseManager,
 } = require("./host-operation-lease.js");
 const PACKAGE_JSON = require("./package.json");
+const { MacAuthentication, sshAuthArgs } = require("./mac-auth");
+let macAuthentication;
 const APPDATA = require("./mac-paths").applicationDataRoot();
 const SHARED_SERVER_DIR = path.join(APPDATA, "SimpleSFTPMac", "server-profiles");
 const SHARED_SERVER_FILE = path.join(SHARED_SERVER_DIR, "servers.json");
@@ -158,9 +160,13 @@ let serverStatusButton;
 let sharedWatcher;
 const hostOperationLease = new HostOperationLeaseManager();
 
-function activate(context) {
+async function activate(context) {
   extensionDeactivating = false;
   extensionContext = context;
+  if (process.platform === "darwin") {
+    macAuthentication = new MacAuthentication(context, vscode.window);
+    await macAuthentication.start();
+  }
   loadTransferOperationLedger();
   refreshConnectTimeoutFromConfig();
   const command = vscode.commands.registerCommand(
@@ -183,6 +189,14 @@ function activate(context) {
     "simpleSftpMac.selectServer",
     () => selectServer()
   );
+  context.subscriptions.push(vscode.commands.registerCommand("simpleSftpMac.configureAuthentication", async () => {
+    require("./mac-update-gate").assertBusinessAllowed();
+    if (!macAuthentication) throw new Error("独立认证入口仅支持 Mac。");
+    const servers = readSharedServers().servers;
+    const selected = await vscode.window.showQuickPick(servers.map(server => ({ label: server.label || server.id, description: `${server.user || server.username || ""}@${server.host}`, server })), { title: "选择要配置独立认证的服务器" });
+    if (selected) await macAuthentication.configure({ ...apiTransferSftp({ server: selected.server }),
+      username: selected.server.user || selected.server.username || "", port: normalizeSshPort(selected.server.sshPort || selected.server.port, 22) });
+  }));
   const importSshConfigCommand = vscode.commands.registerCommand(
     "simpleSftpMac.importSshConfig",
     () => importSharedSshConfig()
@@ -479,6 +493,7 @@ class ActionTreeProvider {
         icon: "info",
         command: "simpleSftpMac.showCurrentTarget",
       }),
+      new ActionTreeItem({ label: "配置服务器认证", description: "密钥、ssh-agent、密码与口令", icon: "key", command: "simpleSftpMac.configureAuthentication" }),
     ];
   }
 }
@@ -905,8 +920,9 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
   const sourceCommand = options.sourceCommand || `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(source.remotePath)} && ${tarPackingCommand(compression)}`)}`;
   const destinationCommand = options.destinationCommand || `bash -o pipefail -c ${shellQuote(stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, paths) )}`;
   return new Promise((resolve, reject) => {
-    const reader = spawn("ssh", getSshArgs(source, sourceCommand), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-    const writer = spawn("ssh", getSshArgs(destination, destinationCommand), { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
+    getSshArgs(source, sourceCommand); getSshArgs(destination, destinationCommand);
+    const reader = spawnSsh(source, sourceCommand, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const writer = spawnSsh(destination, destinationCommand, { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
     let sourceCode;
     let destinationCode;
     const sourceErrors = transferErrorLog(paths), destinationErrors = transferErrorLog(paths);
@@ -1273,7 +1289,7 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs, options = {}) {
   if (remoteBatchTransport) return Promise.resolve().then(() => remoteBatchTransport(source, command, paths, timeoutMs, options));
   const stage = options.stage || remoteBatchStage(command);
   return new Promise((resolve, reject) => {
-    const child = spawn("ssh", ["-A", "-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawnSsh(source, command, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }, spawn, ["-A", "-o", "BatchMode=yes"]);
     let stdout = "";
     const errors = transferErrorLog(paths);
     let wireBuffer = "", wireBytes = 0;
@@ -1627,7 +1643,7 @@ function runCompressionProbe(target, command) {
   // Existing transport test doubles represent archive/hash channels only.
   if (remoteBatchTransport || mappedDownloadTransport) return Promise.resolve("");
   return new Promise((resolve, reject) => {
-    const child = execFile("ssh", getSshArgs(target, command), { timeout: SAMPLE_TIMEOUT_MS, windowsHide: true, maxBuffer: 16384 }, (error, stdout) => error ? reject(error) : resolve(stdout));
+    const child = execSsh(target, command, { timeout: SAMPLE_TIMEOUT_MS, windowsHide: true, maxBuffer: 16384 }, (error, stdout) => error ? reject(error) : resolve(stdout));
     const monitor = watchTransferProcess(child, reject, false, [], false);
     child.stdout?.on("data", monitor.receive);
   });
@@ -2585,7 +2601,7 @@ function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
   ].join("\n");
   const command = `python3 -c ${shellQuote(script)} ${shellQuote(String(sftp.remotePath).replace(/\/+$/, ""))}`;
   return new Promise((resolve, reject) => {
-    const child = spawn("ssh", getSshArgs(sftp, command), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawnSsh(sftp, command, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -3133,7 +3149,7 @@ async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项�
 function listRemoteFiles(sftp, remotePath) {
   const command = `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null | sort`;
   return new Promise((resolve, reject) => {
-    const child = execFile("ssh", getSshArgs(sftp, command), { timeout: 0, windowsHide: true }, (error, stdout, stderr) => {
+    const child = execSsh(sftp, command, { timeout: 0, windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(`列出远端文件失败：${stderr || error.message}`));
         return;
@@ -3151,7 +3167,7 @@ function listRemoteFiles(sftp, remotePath) {
 function listRemoteDirs(sftp, remotePath) {
   const args = createListRemoteDirsSshArgs(sftp, remotePath);
   return new Promise((resolve, reject) => {
-    const child = execFile("ssh", args, { timeout: 0, windowsHide: true }, (error, stdout, stderr) => {
+    const child = execSsh(sftp, args.at(-1), { timeout: 0, windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(`列出远端目录失败：${stderr || error.message}`));
         return;
@@ -4726,7 +4742,7 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
 
 function runSsh(sftp, command, timeout) {
   return new Promise((resolve, reject) => {
-    const child = execFile("ssh", getSshArgs(sftp, command), { timeout: 0, windowsHide: true, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execSsh(sftp, command, { timeout: 0, windowsHide: true, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) {
         const failure = new Error(stderr || error.message);
         failure.stderr = stderr;
@@ -5105,6 +5121,7 @@ function runLocalTarUpload(options) {
 }
 function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
+  getSshArgs(sftp, remoteCommand);
   const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
   const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath)).join("\n")}\n`;
   const chunkedChecksum = hashUploadPlanChunks(plan.files);
@@ -5119,10 +5136,9 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
     });
     controller.totalBytes = plan.byteCount;
     let reportedPercent = 0;
-    const sshProc = spawn("ssh", getSshArgs(sftp, remoteCommand), {
-      windowsHide: true,
-      stdio: ["pipe", "ignore", "pipe"],
-    });
+    let sshProc;
+    try { sshProc = spawnSsh(sftp, remoteCommand, { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] }); }
+    catch (error) { controller.dispose(); throw error; }
     trackTransferResource(sshProc, controller.operationId);
 
     let settled = false;
@@ -5390,6 +5406,7 @@ async function downloadMappedPathsInternal(options = {}) {
 
 function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, transferId, onSpawn, progress, spawnImpl }) {
   const remoteCommand = createMappedDownloadCommand(sftp, plan);
+  getSshArgs(sftp, remoteCommand);
   const remoteRequest = createMappedDownloadRequest(sftp, plan);
   const { PassThrough } = require("stream");
   const output = new PassThrough();
@@ -5411,10 +5428,10 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
   const launch = spawnImpl || spawn;
   let sshProc;
   try {
-    sshProc = launch("ssh", getSshArgs(sftp, remoteCommand), {
+    sshProc = spawnSsh(sftp, remoteCommand, {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
-    });
+    }, launch);
   } catch (error) {
     // No child exists: do not retain a phantom active transfer after spawn fails.
     controller.dispose();
@@ -5962,6 +5979,7 @@ function runRemoteTarExtract(options) {
 }
 function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteTarCommand(sftp, downloadScope);
+  getSshArgs(sftp, remoteCommand);
   return new Promise((resolve, reject) => {
     const controller = createTransferController({
       id: transferId || nextTransferId("远端到本地同步"),
@@ -5970,10 +5988,9 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
       remotePath: String(sftp && sftp.remotePath || ""),
       host: String(sftp && sftp.host || ""),
     });
-    const sshProc = spawn("ssh", getSshArgs(sftp, remoteCommand), {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let sshProc;
+    try { sshProc = spawnSsh(sftp, remoteCommand, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (error) { controller.dispose(); throw error; }
     const tarProc = spawn("tar", ["-xvf", "-", "-C", localPath], {
       windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
@@ -6321,7 +6338,7 @@ function getSshTarget(sftp) {
 }
 
 function getSshArgs(sftp, command) {
-  const args = [];
+  const args = macAuthentication ? sshAuthArgs(macAuthentication.config(sftp)) : [];
   const port = normalizeSshPort(sftp && sftp.port, 22);
   if (port !== 22) {
     args.push("-p", String(port));
@@ -6336,6 +6353,18 @@ function getSshArgs(sftp, command) {
   args.push(getSshTarget(sftp), command);
   return args;
 }
+
+function authenticatedSsh(sftp, command, options, launch, extra = []) {
+  const args = getSshArgs(sftp, command);
+  const auth = macAuthentication?.invocation(sftp);
+  try {
+    const child = launch("ssh", [...(auth ? [] : extra), ...args], auth ? { ...options, env: auth.env } : options);
+    if (auth) { child.once("close", auth.release); child.once("error", auth.release); }
+    return child;
+  } catch (error) { auth?.release(); throw error; }
+}
+function spawnSsh(sftp, command, options, launch = spawn, extra = []) { return authenticatedSsh(sftp, command, options, launch, extra); }
+function execSsh(sftp, command, options, callback) { return authenticatedSsh(sftp, command, options, (file, args, config) => execFile(file, args, config, callback)); }
 
 function normalizeSshPort(value, fallback = 22) {
   const port = Number(value);
@@ -6450,6 +6479,7 @@ async function deactivate() {
   };
   await boundedWait(Promise.all([...activeTransferResources.keys()].map(waitLocalTransferResources)));
   await boundedWait(persistTransferOperationLedger());
+  if (macAuthentication) { await macAuthentication.dispose(); macAuthentication = undefined; }
   if (localApiServer) {
     await localApiServer.dispose().catch(() => undefined);
     localApiServer = undefined;
@@ -6494,6 +6524,9 @@ module.exports = {
   activate,
   deactivate,
   __test: {
+    spawnSsh,
+    getSshArgs,
+    setMacAuthentication: value => { macAuthentication = value; },
     addTarExcludePattern,
     apiTransferSftp,
     createListRemoteDirsSshArgs,
