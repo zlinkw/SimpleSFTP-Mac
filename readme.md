@@ -115,7 +115,13 @@ Mac 跨服务器传输分别认证两端，默认经本机 SSH 流式中转，�
 
 API 方法沿用原契约。地址、token、pid、版本来自当前发现文件，请求需要 Bearer token；每次调用前读取 `/api/v1/capabilities` 或 `/api/v1/openapi.json`，禁止猜端口和参数。
 
-CLI 为 `simple-sftp-mac-api`，从源码 npm 包入口使用，不保证 VSIX 安装后自动加入 shell PATH；自定义发现文件环境变量为 `SIMPLE_SFTP_MAC_API_FILE`。
+CLI 为 `simple-sftp-mac-api`，保留原 npm 入口。VSIX 在受支持 Mac 激活时生成固定入口，更新并重载后刷新到当前包；终端需要 **Node.js 20 或以上**。按 **⇧⌘P → SimpleSFTP Mac：查看 CLI 入口**，点击 **复制自检命令** 后执行，或直接运行：
+
+```sh
+"$HOME/Library/Application Support/SimpleSFTPMac/cli/simple-sftp-mac-api" self-check
+```
+
+自检只核对 CLI、发现文件和本机 API 监听，不连接 SSH 或验证远端任务。入口保留当前工作目录及中文/空格/引号参数，不自动修改 PATH；用户可自行将此 `cli` 目录加入终端 PATH，更新后无需重设。旧实例不把入口降级，未知文件/链接拒绝覆盖。找不到 Node 时先配置终端 Node；缺少发现文件/监听时，打开 VS Code 并确认 SFTP Mac 已激活。自定义发现文件环境变量为 `SIMPLE_SFTP_MAC_API_FILE`。固定入口与自检通过真实本地 shell/Node/API 模拟测试，业务命令与 M5 继续分批验收。
 
 ## 发布与验收
 
