@@ -146,7 +146,7 @@ class ResourceOperationLeaseManager {
         const processOwner = `${os.hostname()}:${this.processId}`;
         const stableOwner = this.windowId.startsWith(processOwner + ":") ? processOwner : this.windowId;
         this.file = path.join(this.directory, crypto.createHash("sha256").update(stableOwner).digest("hex") + ".json");
-        const key = this.file.toLowerCase();
+        const key = process.platform === "win32" ? this.file.toLowerCase() : this.file;
         if (!pools.has(key))
             pools.set(key, { queue: Promise.resolve(), registry: { schemaVersion: 2, windowId: this.windowId, processId: this.processId, ticket: 0, choosing: false, admissionExpiresAt: 0, leases: [] } });
         this.state = pools.get(key);
