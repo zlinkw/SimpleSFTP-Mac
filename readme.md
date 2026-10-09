@@ -129,6 +129,8 @@ CLI 业务 RPC 自动读取当前 Mac 发现文件和 `/api/v1/capabilities`，�
 
 配套 Mac 服务端在准备、校验及提交关键边界核对当前真实工作区；项目变化后重新预检，活动 Plan 不通过旧自动停止 fallback 中断。正式种子配置在保存的 Plan `seeds` 中，在线 Plan CLI 的 `--seed` 和 workflow API 的 `seed` 覆盖参数会拒绝；离线预览只返回 `seedApplied: false`。这些检查通过本地模拟，真实科研仍待验收。
 
+Plan 等待回执、人工重新运行及多 Worker 分布式同步/预演/排队也核对原项目；项目切换后请回到原项目确认操作和远端状态，不把另一项目的活动记录视为成功，不盲目重发。窗口切换不会自动停止远端已有实验。
+
 ## 发布与验收
 
 两仓验证、提交并同步 origin/master 后，在 SimpleExperiment-Mac 执行 `npm run release:prepare`、`npm run release:publish`。release.json 绑定两仓提交，核验全部附件后发布，已发布版本不可覆盖。不使用 GitHub Actions，不自动安装开发机扩展。
