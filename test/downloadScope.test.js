@@ -23,6 +23,8 @@ function extractFunction(name) {
 
 function loadScopeHelpers() {
   const sandbox = {
+    process,
+    ...require("../workspace-path"),
     Buffer,
     path,
     DEFAULT_DOWNLOAD_EXTENSIONS: ["*"],
@@ -73,7 +75,7 @@ test("scoped remote archive applies selected paths, extensions and size", () => 
 
 test("download scope command is exposed to VS Code and local API", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
-  assert.ok(pkg.activationEvents.includes("onCommand:simpleSftp.configureDownloadScope"));
-  assert.ok(pkg.contributes.commands.some((item) => item.command === "simpleSftp.configureDownloadScope"));
+  assert.ok(pkg.activationEvents.includes("onCommand:simpleSftpMac.configureDownloadScope"));
+  assert.ok(pkg.contributes.commands.some((item) => item.command === "simpleSftpMac.configureDownloadScope"));
   assert.match(source, /"downloadScope\.configure": async/);
 });

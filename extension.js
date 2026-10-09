@@ -2747,7 +2747,8 @@ function normalizeDownloadMaxFileSizeMB(value) {
 }
 
 function normalizeDownloadScopePath(value) {
-  const normalized = toPosixPath(String(value || "").trim()).replace(/^\.\//, "").replace(/^\/+|\/+$/g, "");
+  const normalized = process.platform === "darwin" ? normalizeMacRelativePath(value, "下载范围相对路径", true)
+    : toPosixPath(String(value || "").trim()).replace(/^\.\//, "").replace(/^\/+|\/+$/g, "");
   if (!normalized || normalized === ".") return ".";
   if (path.posix.isAbsolute(normalized) || normalized.split("/").some((part) => !part || part === "." || part === "..")) {
     throw new Error(`下载范围必须是远端项目内相对路径：${value}`);
@@ -2781,9 +2782,11 @@ function normalizeDownloadScope(value = {}) {
 }
 
 function explicitDownloadScope(options = {}) {
-  if (!Array.isArray(options.paths) || !options.paths.length || options.paths.some((item) => item === "."))
+  if (!Array.isArray(options.paths) || !options.paths.length)
     throw new Error("显式下载路径必须是一个或多个项目内文件或目录，禁止选择整个项目根目录。");
-  return normalizeDownloadScope({ paths: options.paths, extensions: ["*"], noSizeLimit: true });
+  const scope = normalizeDownloadScope({ paths: options.paths, extensions: ["*"], noSizeLimit: true });
+  if (scope.paths.includes(".")) throw new Error("显式下载路径必须是一个或多个项目内文件或目录，禁止选择整个项目根目录。");
+  return scope;
 }
 
 const MAPPED_DOWNLOAD_DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024;
@@ -3015,8 +3018,8 @@ function writeTargetDownloadScope(localPath, options, sftp, scope) {
 }
 
 function relativeRemoteScopePath(remoteRoot, selectedPath) {
-  const base = path.posix.normalize(String(remoteRoot || "").replace(/\/+$/, ""));
-  const selected = path.posix.normalize(String(selectedPath || "").replace(/\/+$/, ""));
+  const base = process.platform === "darwin" ? remotePathText(remoteRoot, "darwin") : path.posix.normalize(String(remoteRoot || "").replace(/\/+$/, ""));
+  const selected = process.platform === "darwin" ? remotePathText(selectedPath, "darwin") : path.posix.normalize(String(selectedPath || "").replace(/\/+$/, ""));
   if (!base || !selected || (selected !== base && !selected.startsWith(`${base}/`))) {
     throw new Error(`所选远端路径超出项目根目录：${selectedPath}`);
   }
@@ -3091,12 +3094,13 @@ async function configureDownloadScopeCore(options = {}) {
       const removed = new Set(picked.map((item) => item.label));
       next.paths = current.paths.filter((relative) => !removed.has(relative));
     } else if (action.id === "folder") {
-      const selected = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "选择允许下载的远端文件夹", showHiddenTopLevel: true });
+      const selected = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "选择允许下载的远端文件夹", showHiddenTopLevel: true, confineToBase: true });
       if (!selected) return { ok: false, cancelled: true };
       next.paths = [...new Set([...current.paths, relativeRemoteScopePath(sftp.remotePath, selected)])].sort((a, b) => a.localeCompare(b));
     } else if (action.id === "file") {
-      const selectedDir = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "进入远端文件所在目录", showHiddenTopLevel: true });
+      const selectedDir = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "进入远端文件所在目录", showHiddenTopLevel: true, confineToBase: true });
       if (!selectedDir) return { ok: false, cancelled: true };
+      relativeRemoteScopePath(sftp.remotePath, selectedDir);
       const files = await listRemoteFiles(sftp, selectedDir);
       const picked = await vscode.window.showQuickPick(files.map((file) => ({ label: file.name, description: formatBytes(file.sizeBytes), file })), { title: `选择远端文件：${selectedDir}`, canPickMany: true, ignoreFocusOut: true });
       if (!picked?.length) return { ok: false, cancelled: true };
@@ -3126,9 +3130,12 @@ function mergeIgnorePatterns(...groups) {
   return [...out].sort((a, b) => a.localeCompare(b));
 }
 
-async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项目根目录", showHiddenTopLevel = false }) {
-  let current = remoteBase.replace(/\/+$/, "");
+async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项目根目录", showHiddenTopLevel = false, confineToBase = false }) {
+  if (process.platform === "darwin") remoteBase = remotePathText(remoteBase, "darwin", true);
+  let current = remoteBase === "/" ? "/" : remoteBase.replace(/\/+$/, "");
+  const initial = current;
   for (;;) {
+    if (confineToBase) relativeRemoteScopePath(remoteBase, current);
     const dirs = await listRemoteDirs(sftp, current);
     const items = [
       {
@@ -3143,7 +3150,7 @@ async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项�
       },
     ];
 
-    if (current !== remoteBase.replace(/\/+$/, "")) {
+    if (current !== initial) {
       items.push({
         label: "$(arrow-up) 返回上一级",
         description: path.posix.dirname(current),
@@ -3152,12 +3159,12 @@ async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项�
     }
 
     for (const dir of dirs) {
-      if (!showHiddenTopLevel && current === remoteBase.replace(/\/+$/, "") && HIDDEN_TOP_LEVEL.has(dir)) {
+      if (!showHiddenTopLevel && current === initial && HIDDEN_TOP_LEVEL.has(dir)) {
         continue;
       }
       items.push({
         label: `$(folder) ${dir}`,
-        description: `${current}/${dir}`,
+        description: path.posix.join(current, dir),
         kind: "dir",
         name: dir,
       });
@@ -3180,23 +3187,43 @@ async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项�
         prompt: "输入远端项目根目录路径。",
         value: current,
       });
-      return manual ? remotePathText(manual, process.platform) : null;
+      if (!manual) return null;
+      const selected = remotePathText(manual, process.platform);
+      if (confineToBase) relativeRemoteScopePath(remoteBase, selected);
+      return selected;
     }
     if (picked.kind === "dir") {
-      current = `${current}/${picked.name}`;
+      current = path.posix.join(current, picked.name);
     }
   }
 }
 
 function listRemoteFiles(sftp, remotePath) {
-  const command = `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null | sort`;
+  if (process.platform === "darwin") remotePath = remotePathText(remotePath, "darwin", true);
+  const command = process.platform === "darwin"
+    ? `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type f -printf '%f\\0%s\\0'`
+    : `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null | sort`;
   return new Promise((resolve, reject) => {
     const child = execSsh(sftp, command, { timeout: 0, windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(`列出远端文件失败：${stderr || error.message}`));
         return;
       }
-      resolve(stdout.split(/\r?\n/).map((line) => {
+      if (process.platform === "darwin") {
+        try {
+          if (!stdout) { resolve([]); return; }
+          const fields = stdout.split("\0");
+          if (fields.pop() !== "" || fields.length % 2) throw new Error("远端文件列表不完整。");
+          const files = [], seen = new Set();
+          for (let index = 0; index < fields.length; index += 2) {
+            const name = normalizeMacRelativePath(fields[index], "远端文件名");
+            const sizeText = fields[index + 1], sizeBytes = Number(sizeText);
+            if (name !== fields[index] || name.includes("/") || seen.has(name) || !/^\d+$/.test(sizeText) || !Number.isSafeInteger(sizeBytes)) throw new Error("远端文件列表包含无效条目。");
+            seen.add(name); files.push({ name, sizeBytes });
+          }
+          resolve(files.sort((a, b) => a.name.localeCompare(b.name)));
+        } catch (error) { reject(error); }
+      } else resolve(stdout.split(/\r?\n/).map((line) => {
         const [name, sizeText] = line.split("\t");
         return { name: String(name || "").trim(), sizeBytes: Number(sizeText) || 0 };
       }).filter((item) => item.name));
@@ -6175,7 +6202,7 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
 }
 
 function createRemoteTarCommand(sftp, downloadScope) {
-  const remotePath = String(sftp.remotePath).replace(/\/+$/, "");
+  const remotePath = process.platform === "darwin" ? remotePathText(sftp.remotePath, "darwin") : String(sftp.remotePath).replace(/\/+$/, "");
   const scope = downloadScope && Array.isArray(downloadScope.paths) && downloadScope.paths.length
     ? normalizeDownloadScope(downloadScope)
     : null;
@@ -6193,6 +6220,7 @@ function createRemoteTarCommand(sftp, downloadScope) {
 }
 
 function createRemoteDownloadScript(remotePath, downloadScope) {
+    if (process.platform === "darwin") remotePath = remotePathText(remotePath, "darwin");
     const scope = normalizeDownloadScope(downloadScope);
     const payload = Buffer.from(JSON.stringify(scope), "utf8").toString("base64");
     return [
@@ -6216,19 +6244,26 @@ function createRemoteDownloadScript(remotePath, downloadScope) {
       "    return True",
       "selected=[]",
       "seen=set()",
+      "def safe_relative(rel,allow_root=False):",
+      "    if not isinstance(rel,str) or not rel or len(rel.encode('utf-8')) > 4096 or any(ord(c)<32 or ord(c)==127 or c in (':',chr(92)) for c in rel): return False",
+      "    return (allow_root and rel=='.') or all(p and p not in ('.','..') for p in rel.split('/'))",
       "def inside(value):",
       "    try: return os.path.commonpath([root, value]) == root",
       "    except ValueError: return False",
       "def allowed(rel, full):",
-      "    if not rel or rel in seen or os.path.islink(full) or not os.path.isfile(full): return False",
+      "    if not safe_relative(rel) or rel in seen or os.path.islink(full) or not os.path.isfile(full): return False",
       "    if blocked_path(rel): return False",
       "    if max_bytes is not None and os.path.getsize(full) > max_bytes: return False",
       "    lower=rel.lower()",
       "    return allow_any or any(lower.endswith(ext) for ext in extensions)",
       "for rel_root in paths:",
-      "    rel_root=str(rel_root or '.').replace('\\\\','/').strip('/') or '.'",
-      "    target=os.path.realpath(os.path.join(root, rel_root))",
-      "    if not inside(target) or os.path.islink(target): continue",
+      "    if not safe_relative(rel_root,True): raise SystemExit('unsafe download scope')",
+      "    target=os.path.join(root, rel_root)",
+      "    cursor=root",
+      "    for part in rel_root.split('/'):",
+      "        cursor=os.path.join(cursor,part)",
+      "        if os.path.islink(cursor): raise SystemExit('download scope contains symlink')",
+      "    if not inside(os.path.realpath(target)): raise SystemExit('download scope escapes root')",
       "    if os.path.isfile(target):",
       "        rel=os.path.relpath(target,root).replace(os.sep,'/')",
       "        if allowed(rel,target): seen.add(rel); selected.append((rel,target))",

@@ -9,6 +9,8 @@ const start = source.indexOf("function normalizeDownloadExtensions(");
 const end = source.indexOf("async function configureDownloadScope(", start);
 assert.ok(start >= 0 && end > start);
 const sandbox = {
+  process,
+  ...require("../workspace-path"),
   path,
   DEFAULT_DOWNLOAD_EXTENSIONS: ["*"],
   DEFAULT_DOWNLOAD_MAX_FILE_SIZE_MB: 1024,
