@@ -509,7 +509,7 @@ class LocalApiServer {
 
   withDiscoveryLease(work) {
     const project = path.dirname(path.resolve(this.discoveryPath));
-    return this.discoveryLease.run({ pluginId: "simple-local.simple-sftp", workspaceUri: "file://" + project, hostProjectPath: project, actionType: "api-discovery", waitForConflict: true,
+    return this.discoveryLease.run({ pluginId: "simple-local.simple-sftp-mac", workspaceUri: "file://" + project, hostProjectPath: project, actionType: "api-discovery", waitForConflict: true,
       resources: [{ server: "local", project, target: path.resolve(this.discoveryPath) }] }, work);
   }
 

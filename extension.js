@@ -3248,6 +3248,7 @@ function getWorkspaceRoot(folder = getPrimaryWorkspaceFolder()) {
 }
 
 async function withFileResourceLease(operation, project, paths, server, work) {
+  if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
   if (process.platform !== "win32") throw new Error("SimpleSFTP 文件副作用必须由 Windows UI Extension Host 执行。");
   const targetProject = server === "local" ? path.resolve(project) : String(project).replace(/\/+$/, "");
   const resources = (paths.length ? paths : [targetProject]).map(target => ({
@@ -3259,6 +3260,7 @@ async function withFileResourceLease(operation, project, paths, server, work) {
 function remoteResourceServer(sftp) { return String(sftp.host).toLowerCase() + ":" + normalizeSshPort(sftp.port, 22); }
 
 async function withHostOperationLease(actionType, actionLabel, localPath, operation) {
+  if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
   if (process.platform !== "win32") {
     throw new Error("SimpleSFTP 文件副作用必须由 Windows UI Extension Host 执行。");
   }
@@ -3812,6 +3814,7 @@ function uploadProgressCancellable(options = {}) {
 }
 
 function runUploadWithProgress(options, title, operation) {
+  if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
   const execute = async (progress, token) => {
     const controller = createTransferController({ id: nextTransferId(title), operation: title, localPath: options.localPath || "", remotePath: options.sftp?.remotePath || "", host: options.sftp?.host || "" });
     controller.operationId = options._operationId || transferContext.getStore()?.operationId || controller.id;
@@ -6459,6 +6462,7 @@ function waitLocalTransferResources(operationId) {
 }
 
 async function withTransferCapacity(options, work) {
+  if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
   const parent = transferContext.getStore();
   const abort = new AbortController();
   const cancel = reason => abort.abort(new Error(reason || "传输已取消"));

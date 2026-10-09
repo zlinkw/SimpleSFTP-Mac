@@ -36,7 +36,9 @@
 		"bin/simple-sftp-api.js",
 		"readme.md",
 		"LICENSE.txt",
-		"mac-paths.js"
+		"mac-paths.js",
+		"mac-bootstrap.js",
+		"mac-update-gate.js"
 	],
 	"engines": {
 		"vscode": "^1.80.0"
@@ -58,7 +60,7 @@
 		"onCommand:simpleSftpMac.markHandoffReady",
 		"onCommand:simpleSftpMac.configureDownloadScope"
 	],
-	"main": "./extension.js",
+	"main": "./mac-bootstrap.js",
 	"contributes": {
 		"commands": [
 			{
@@ -100,6 +102,10 @@
 			{
 				"command": "simpleSftpMac.showCurrentTarget",
 				"title": "SimpleSFTP：查看当前目标"
+			},
+			{
+				"command": "simpleSftpMac.checkPreviewUpdates",
+				"title": "SimpleSFTP Mac：检查 preview 配套更新"
 			}
 		],
 		"views": {
