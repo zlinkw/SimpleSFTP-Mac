@@ -1,0 +1,7 @@
+node_modules/
+*.vsix
+*.vsix.writing
+__pycache__/
+*.pyc
+baseline-source.zip
+release-artifacts/

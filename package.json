@@ -1,0 +1,208 @@
+{
+	"name": "simple-sftp",
+	"displayName": "SimpleSFTP",
+	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
+	"version": "0.2.61",
+	"publisher": "simple-local",
+	"extensionKind": [
+		"ui"
+	],
+	"license": "MIT",
+	"scripts": {
+		"test": "node scripts/test-serial.js",
+		"build": "node scripts/verify-runtime.js",
+		"package": "npm run build && node scripts/package-vsix.js",
+		"install:latest": "pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/install-latest.ps1"
+	},
+	"bin": {
+		"simple-sftp-api": "./bin/simple-sftp-api.js"
+	},
+	"files": [
+		"extension.js",
+		"api-server.js",
+		"host-operation-lease.js",
+		"progress-inactivity.js",
+		"latest-snapshot-writer.js",
+		"transfer-capacity.js",
+		"transfer-settlement.js",
+		"transfer-settlement-probe.py",
+		"compression-policy.js",
+		"compression-sample.py",
+		"staged-tar-receive.py",
+		"resource-operation-lease.js",
+		"state-store.js",
+		"workspace-path.js",
+		"tar-writer.js",
+		"bin/simple-sftp-api.js",
+		"readme.md",
+		"LICENSE.txt"
+	],
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onStartupFinished",
+		"onView:simpleSftp.actions",
+		"onCommand:simpleSftp.createOrOpen",
+		"onCommand:simpleSftp.selectServer",
+		"onCommand:simpleSftp.importSshConfig",
+		"onCommand:simpleSftp.openSharedServerConfig",
+		"onCommand:simpleSftp.showCurrentTarget",
+		"onCommand:simpleSftp.syncFromRemote",
+		"onCommand:simpleSftp.uploadWorkspace",
+		"onCommand:simpleSftp.uploadFiles",
+		"onCommand:simpleSftp.markHandoffReady",
+		"onCommand:simpleSftp.configureDownloadScope"
+	],
+	"main": "./extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "simpleSftp.createOrOpen",
+				"title": "SimpleSFTP：创建或打开远端项目"
+			},
+			{
+				"command": "simpleSftp.syncFromRemote",
+				"title": "SimpleSFTP：远端同步到本地"
+			},
+			{
+				"command": "simpleSftp.uploadWorkspace",
+				"title": "SimpleSFTP：上传工作区到目标"
+			},
+			{
+				"command": "simpleSftp.uploadFiles",
+				"title": "SimpleSFTP：上传指定文件到目标"
+			},
+			{
+				"command": "simpleSftp.markHandoffReady",
+				"title": "SimpleSFTP：上传并标记交接"
+			},
+			{
+				"command": "simpleSftp.configureDownloadScope",
+				"title": "SimpleSFTP：设置下载文件范围"
+			},
+			{
+				"command": "simpleSftp.selectServer",
+				"title": "SimpleSFTP：选择服务器"
+			},
+			{
+				"command": "simpleSftp.importSshConfig",
+				"title": "SimpleSFTP：导入 VS Code SSH 配置"
+			},
+			{
+				"command": "simpleSftp.openSharedServerConfig",
+				"title": "SimpleSFTP：打开共享服务器配置"
+			},
+			{
+				"command": "simpleSftp.showCurrentTarget",
+				"title": "SimpleSFTP：查看当前目标"
+			}
+		],
+		"views": {
+			"explorer": [
+				{
+					"id": "simpleSftp.actions",
+					"name": "SimpleSFTP"
+				}
+			]
+		},
+		"configuration": {
+			"title": "SimpleSFTP",
+			"properties": {
+				"simpleSftp.workspaceHostRoot": {
+					"type": "string",
+					"default": "",
+					"scope": "application",
+					"description": "可选 Windows 宿主工作区根目录。仅用于将 Dev Container 工作区映射到 UI Extension Host；普通 Windows 工作区无需配置。"
+				},
+				"simpleSftp.workspaceContainerRoot": {
+					"type": "string",
+					"default": "",
+					"scope": "application",
+					"description": "可选 Dev Container 工作区根目录，例如 /workspaces。远程工作区上传下载必须同时配置宿主根。"
+				},
+				"simpleSftp.remoteBase": {
+					"type": "string",
+					"default": "",
+					"description": "用于选择项目的远端根目录。"
+				},
+				"simpleSftp.localBase": {
+					"type": "string",
+					"default": "",
+					"description": "创建同步项目时使用的本地根目录。"
+				},
+				"simpleSftp.sshHost": {
+					"type": "string",
+					"default": "",
+					"description": "用于 SFTP 目录浏览和文件同步的 SSH host alias。"
+				},
+				"simpleSftp.execHost": {
+					"type": "string",
+					"default": "",
+					"description": "写入 AGENTS.md 命令示例的 SSH host。"
+				},
+				"simpleSftp.userName": {
+					"type": "string",
+					"default": "",
+					"description": "远端 SSH 用户名。"
+				},
+				"simpleSftp.sshPort": {
+					"type": "number",
+					"default": 22,
+					"minimum": 1,
+					"maximum": 65535,
+					"description": "SSH 与 SFTP 命令使用的远端端口。"
+				},
+				"simpleSftp.handoffPrompt": {
+					"type": "boolean",
+					"default": true,
+					"description": "打开由其他设备交接过的 SimpleSFTP 工作区时，提示先同步远端代码。"
+				},
+				"simpleSftp.handoffMarkerName": {
+					"type": "string",
+					"default": ".simple-sftp-handoff.json",
+					"description": "远端交接标记文件名。"
+				},
+				"simpleSftp.uploadOnSave": {
+					"type": "boolean",
+					"default": true,
+					"description": "保存文件时自动上传本地变更文件。"
+				},
+				"simpleSftp.writeAgentsFile": {
+					"type": "boolean",
+					"default": true,
+					"description": "创建或更新 AGENTS.md 中由 SimpleSFTP 管理的 Codex/agent 说明块。"
+				},
+				"simpleSftp.connectTimeoutSeconds": {
+					"type": "number",
+					"default": 30,
+					"minimum": 1,
+					"maximum": 3600,
+					"description": "SSH 建立连接超时秒数，防止服务器未开机或隧道不可用时上传、下载长时间挂起。"
+				},
+				"simpleSftp.uploadTimeoutSeconds": {
+					"type": "number",
+					"default": 600,
+					"minimum": 0,
+					"maximum": 86400,
+					"description": "兼容旧配置；不再限制业务总时长。文件步骤连续 120 秒无真实进展才结束等待。"
+				},
+				"simpleSftp.uploadCancellable": {
+					"type": "boolean",
+					"default": true,
+					"description": "上传和下载进度通知是否显示手动取消按钮。"
+				}
+			}
+		}
+	},
+	"devDependencies": {
+		"@vscode/vsce": "4.0.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/zlinkw/SimpleSFTP.git"
+	}
+}
