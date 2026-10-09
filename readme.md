@@ -2,7 +2,7 @@
 
 SimpleSFTP Mac 是 Apple Silicon Mac 的 VS Code 文件传输扩展，与 [SimpleExperiment Mac](https://github.com/zlinkw/SimpleExperiment-Mac) 配套。沿用 SSH/tar 流式传输、路径确认和传输结算职责，扩展身份、设置、配置目录和更新源与 Windows 原版独立。
 
-**当前为 preview 测试版，完整 Mac 传输和认证尚未真机验收。** 本地 POSIX 工作区、中文/空格路径和大小写处理已加入源码；密钥、ssh-agent、密码、私钥口令、断连恢复仍需后续适配与验收。不要套用原 Windows 的使用说明。
+**当前为 preview 测试版，完整 Mac 传输和认证尚未真机验收。** 已接入本地 POSIX 工作区、中文/空格路径、大小写及独立密钥、ssh-agent、密码和私钥口令；断连恢复与完整科研接入仍在适配。不要套用原 Windows 的使用说明。
 
 ## 系统要求与首次安装
 
@@ -64,7 +64,7 @@ SimpleSFTP 的检查入口会激活 SimpleExperiment Mac 并检查两个插件�
 ```
 
 4. 保存后运行 **SimpleSFTP：选择服务器**，然后 **SimpleSFTP：查看当前目标**，核对账号、SSH 端口及完整路径。`sshPort` 填服务器 SSH 端口，不能填 Agent HTTP 转发端口。
-5. 已有本机 `~/.ssh/config` 时，可运行 **SimpleSFTP：导入 VS Code SSH 配置** 导入主机描述；不会读取 Termius 私有会话。当前传输依赖系统 SSH 配置，独立认证入口仍在适配，选择或导入配置不表示认证测试通过。
+5. 已有本机 `~/.ssh/config` 时，可运行 **SimpleSFTP：导入 VS Code SSH 配置** 导入主机描述；不会读取 Termius 私有会话。随后运行 **SimpleSFTP Mac：配置服务器认证**，为每个真实 SSH 目标选择认证方式。选择或导入配置不表示连接测试通过。
 
 设置中的路径使用绝对 POSIX 路径，不填盘符、`~`、`$HOME` 或未替换的用户名。保留中文、空格与大小写，终端中的路径有空格时加引号。完整的本机配置、Termius 手动转发及三拓扑接入约定见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md)，配套面板顶部 **配置说明** 也可打开。
 
@@ -74,9 +74,24 @@ SimpleSFTP 的检查入口会激活 SimpleExperiment Mac 并检查两个插件�
 
 保留命令：**创建或打开远端项目**、**选择服务器**、**查看当前目标**、**上传工作区到目标**、**上传指定文件到目标**、**远端同步到本地**、**设置下载文件范围**、**上传并标记交接**。设置命名空间为 `simpleSftpMac.*`。
 
-认证目标为独立支持密钥、ssh-agent、密码和私钥口令，默认仅会话内记忆，勾选后才使用 VS Code SecretStorage。Termius 登录不会自动授权 SimpleSFTP，插件不读取其密码。上述认证入口仍在适配，以实际版本发布说明与真机结果为准。
+### 独立认证入口
 
-跨服务器传输目标为分别认证两端，经本机流式中转，无需服务器之间免密互联。保留哈希核对、有限并发和资源结算职责，本地与远端路径必须来自用户配置。
+按 **⇧⌘P → SimpleSFTP Mac：配置服务器认证**，或在资源管理器 **SimpleSFTP → 配置服务器认证** 中选择已填写的服务器：
+
+| 方式 | 操作 |
+| --- | --- |
+| 系统 SSH 配置 / 自动 | 沿用本机 OpenSSH 配置及默认密钥；私钥口令由插件密码输入框获取 |
+| 选择私钥 | 在 Mac 文件选择框选择真实私钥文件；保留中文和空格路径。加密私钥在首次连接时提示输入口令 |
+| ssh-agent | 使用当前 VS Code 进程可见的 `SSH_AUTH_SOCK` 中已加载身份，不转发 agent 到服务器 |
+| 密码 | 首次连接时在 VS Code 密码输入框填写该服务器密码，不要求服务器间免密登录 |
+
+独立密钥、agent 和密码模式直接使用服务器实际地址、用户和端口；不要将只能靠 `~/.ssh/config` 解析的别名当作真实主机。需要沿用自己的 SSH 别名/跳板配置时选择自动模式。
+
+认证按实际 SSH 地址、用户名和端口区分，两端分别配置。记忆选项默认不勾选，只在本次扩展会话内记忆；勾选 **使用 VS Code SecretStorage 保存密码 / 私钥口令** 后，输入的凭据才会保存以供重载后使用。选择不勾选时，不读取以前保存的凭据。重新运行配置命令可切换方式和记忆选项。
+
+密码和口令不写入 `servers.json`、项目设置、命令参数或临时文件；SSH 的 tar 标准输入仍只传文件数据。[VS Code SecretStorage](https://code.visualstudio.com/api/references/vscode-api#SecretStorage) 负责已选择保存的凭据。Termius 登录不会自动授权 SimpleSFTP，插件不读取其密码。真实密钥/密码上传下载、连接恢复仍待 M5 验收。
+
+跨服务器传输的后续适配目标为分别认证两端，经本机流式中转，无需服务器之间免密互联；默认路由与大文件分块中转仍在接入。保留哈希核对、有限并发和资源结算职责，本地与远端路径必须来自用户配置。
 
 上传前的路径确认保留。API 缺少确认返回 `CONFIRM_REQUIRED`。永久删除需要精确目标、直接父目录核验与两次确认，普通上传不镜像删除远端内容。
 
