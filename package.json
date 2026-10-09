@@ -37,6 +37,7 @@
 		"readme.md",
 		"LICENSE.txt",
 		"mac-paths.js",
+		"mac-cli.js",
 		"mac-bootstrap.js",
 		"mac-update-gate.js",
 		"mac-auth.js",
@@ -90,6 +91,10 @@
 			{
 				"command": "simpleSftpMac.configureDownloadScope",
 				"title": "SimpleSFTP：设置下载文件范围"
+			},
+			{
+				"command": "simpleSftpMac.showCliEntry",
+				"title": "SimpleSFTP Mac：查看 CLI 入口"
 			},
 			{
 				"command": "simpleSftpMac.selectServer",

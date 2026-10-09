@@ -1,6 +1,7 @@
 "use strict";
 const { spawnSync } = require("node:child_process");
 const gate = require("./mac-update-gate");
+const { registerMacCli } = require("./mac-cli");
 let business;
 async function activate(context) {
   const vscode = require("vscode");
@@ -13,6 +14,7 @@ async function activate(context) {
     if (!experiment.isActive) await experiment.activate();
     return vscode.commands.executeCommand("simpleExperimentMac.checkPreviewUpdates");
   }));
+  const cli = registerMacCli(context, vscode);
   if (process.platform !== "darwin" || process.arch !== "arm64") {
     await vscode.window.showWarningMessage("SimpleSFTP Mac preview 仅支持 Apple Silicon、macOS 26 及以上。"); return;
   }
@@ -20,6 +22,8 @@ async function activate(context) {
   if (version.status !== 0 || Number(version.stdout.trim().split(".")[0]) < 26) {
     await vscode.window.showErrorMessage("SimpleSFTP Mac preview 需要 macOS 26 及以上。"); return;
   }
+  try { cli.refresh(); }
+  catch (error) { void vscode.window.showWarningMessage(`Mac CLI 入口暂不可用：${error.message}。更新入口保留。`); }
   try { business = require("./extension"); await business.activate(context); }
   catch (error) { await vscode.window.showErrorMessage(`SimpleSFTP Mac 业务启动失败，更新入口仍可用：${error.message}`); }
 }
