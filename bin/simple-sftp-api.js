@@ -2,9 +2,8 @@
 "use strict";
 
 const fs = require("fs");
-const http = require("http");
-const os = require("os");
 const path = require("path");
+const { callLocalRpc, readLocalDiscovery, requestLocalJson } = require("../mac-api-client");
 
 const APPDATA = require("../mac-paths").applicationDataRoot();
 const discoveryPath =
@@ -26,14 +25,7 @@ async function main(argv) {
     if (!fs.existsSync(paramsFile)) throw new Error(`params file not found: ${paramsFile}`);
     params = JSON.parse(fs.readFileSync(paramsFile, "utf8"));
   }
-  const discovery = readDiscovery();
-  const payload = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method,
-    params,
-  });
-  const result = await request(discovery, payload);
+  const result = await callLocalRpc(readDiscovery, method, params);
   if (result && result.error) {
     console.log(
       JSON.stringify(
@@ -79,87 +71,21 @@ async function runSelfCheck() {
   return ok ? 0 : 1;
 }
 
-function checkListener(discovery) {
-  const url = new URL("/api/v1/health", String(discovery.baseUrl));
-  return new Promise((resolve) => {
-    const req = http.request(
-      {
-        hostname: url.hostname,
-        port: url.port || 80,
-        path: url.pathname,
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${String(discovery.token)}`,
-        },
-        timeout: 3_000,
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => {
-          try {
-            const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-            if (res.statusCode === 200 && body && body.ok === true) {
-              resolve({ name: "listener", ok: true, detail: `${body.name || discovery.name} ${body.version || discovery.version}` });
-            } else {
-              resolve({ name: "listener", ok: false, detail: `missing listener: HTTP ${res.statusCode}` });
-            }
-          } catch {
-            resolve({ name: "listener", ok: false, detail: `missing listener: invalid health response (HTTP ${res.statusCode})` });
-          }
-        });
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error("health request timed out")));
-    req.on("error", (error) => resolve({ name: "listener", ok: false, detail: `missing listener: ${error.message}` }));
-    req.end();
-  });
+async function checkListener(discovery) {
+  try {
+    const body = await requestLocalJson(discovery, "/api/v1/health", undefined, 64 * 1024, 3000);
+    if (body.ok !== true) throw new Error("invalid health response");
+    return { name: "listener", ok: true, detail: `${body.name || discovery.name} ${body.version || discovery.version}` };
+  } catch (error) {
+    return { name: "listener", ok: false, detail: `missing listener: ${error.message}` };
+  }
 }
 
 function readDiscovery() {
   if (!fs.existsSync(discoveryPath)) {
     throw new Error(`SimpleSFTP API discovery not found: ${discoveryPath}. Open VS Code once to start the extension host.`);
   }
-  const discovery = JSON.parse(fs.readFileSync(discoveryPath, "utf8"));
-  if (!discovery.baseUrl || !discovery.token) {
-    throw new Error(`SimpleSFTP API discovery is invalid: ${discoveryPath}`);
-  }
-  return discovery;
-}
-
-function request(discovery, payload) {
-  const url = new URL("/api/v1/rpc", discovery.baseUrl);
-  const body = Buffer.from(payload, "utf8");
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname: url.hostname,
-        port: url.port || 80,
-        path: url.pathname,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": body.length,
-          Authorization: `Bearer ${discovery.token}`,
-        },
-        timeout: 15_000,
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-          } catch (error) {
-            reject(new Error(`invalid API response: ${error.message}`));
-          }
-        });
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error("SimpleSFTP API request timed out")));
-    req.on("error", reject);
-    req.end(body);
-  });
+  return readLocalDiscovery(discoveryPath);
 }
 
 function option(args, name) {

@@ -38,6 +38,7 @@
 		"LICENSE.txt",
 		"mac-paths.js",
 		"mac-cli.js",
+		"mac-api-client.js",
 		"mac-bootstrap.js",
 		"mac-update-gate.js",
 		"mac-auth.js",
