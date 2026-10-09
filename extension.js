@@ -917,39 +917,62 @@ function relayTarFiles(source, destination, paths, timeoutMs, options = {}) {
 function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) {
   if (!paths.length) return Promise.resolve();
   const compression = transferCompression(options);
-  const sourceCommand = options.sourceCommand || `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(source.remotePath)} && ${tarPackingCommand(compression)}`)}`;
+  const sourceCommand = options.sourceCommand || `bash -o pipefail -c ${shellQuote(`root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && test "$(pwd -P)" = "$root" && ${tarPackingCommand(compression)}`)}`;
   const destinationCommand = options.destinationCommand || `bash -o pipefail -c ${shellQuote(stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, paths) )}`;
   return new Promise((resolve, reject) => {
     getSshArgs(source, sourceCommand); getSshArgs(destination, destinationCommand);
-    const reader = spawnSsh(source, sourceCommand, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-    const writer = spawnSsh(destination, destinationCommand, { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
+    let reader, writer;
     let sourceCode;
     let destinationCode;
     const sourceErrors = transferErrorLog(paths), destinationErrors = transferErrorLog(paths);
-    let settled = false;
+    const children = [], closed = new Set(), monitors = [];
+    let starting = true, settled = false, failureError;
     let wireBytes = 0;
     const finish = (error) => {
       if (settled) return;
+      if (error && !failureError) {
+        failureError = error;
+        reader?.stdout?.unpipe(writer?.stdin);
+        for (const monitor of monitors) monitor.dispose();
+        for (const child of children) if (!closed.has(child)) { try { child.kill(); } catch { /* Close proof is still required. */ } }
+      }
+      // Keep the resource lease until every launched SSH process has closed,
+      // including a reader whose peer failed synchronously during launch.
+      if (starting || closed.size !== children.length) return;
       settled = true;
-      clearTimeout(timer);
-      if (error) { reader.kill(); writer.kill(); reject(error); } else { options.onWireBytes?.(wireBytes); resolve(); }
+      if (failureError) reject(failureError);
+      else { try { options.onWireBytes?.(wireBytes); resolve(); } catch (error) { reject(error); } }
     };
-    const timer = null;
-    const wireScope = `relay-${reader.pid}`;
-    const monitor = watchTransferProcess(reader, finish, true, paths, undefined, { wireScope });
-    const destinationMonitor = watchTransferProcess(writer, finish, true, paths, undefined, { wireScope, filenamePhase: "unpacking" });
-    reader.stdout.on("data", (chunk) => { wireBytes += chunk.length; monitor.receive(chunk); destinationMonitor.receive(chunk); });
-    reader.stderr.on("data", (chunk) => sourceErrors.receive(chunk));
-    writer.stderr.on("data", (chunk) => destinationErrors.receive(chunk));
-    reader.on("error", (error) => finish(error));
-    writer.on("error", (error) => finish(error));
     const failure = () => new Error(`内存转发失败（来源退出码 ${sourceCode} / 目标退出码 ${destinationCode}）：${[sourceErrors.text(), destinationErrors.text()].filter(Boolean).join("\n") || "SSH 不可用"}`);
-    reader.on("close", (code) => { sourceCode = code; if (destinationCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : failure()); });
-    writer.on("close", (code) => { destinationCode = code; if (sourceCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : failure()); });
-    reader.stdout.pipe(writer.stdin);
-    writer.stdin.on("error", () => {});
-    reader.stdin.on("error", () => {});
-    reader.stdin.end(Buffer.from(paths.map((name) => `${name}\0`).join(""), "utf8"));
+    const launch = (target, command, isDestination) => {
+      const child = spawnSsh(target, command, { windowsHide: true, stdio: ["pipe", isDestination ? "ignore" : "pipe", "pipe"] });
+      children.push(child);
+      child.on("error", finish);
+      child.stdin.on("error", finish);
+      child.on("close", (code, signal) => {
+        closed.add(child);
+        if (isDestination) destinationCode = code; else sourceCode = code;
+        finish(code === 0 && !signal ? undefined : failure());
+      });
+      child.stderr.on("data", chunk => (isDestination ? destinationErrors : sourceErrors).receive(chunk));
+      const monitor = watchTransferProcess(child, finish, true, paths, isDestination,
+        { wireScope: `relay-${children[0].pid}`, filenamePhase: isDestination ? "unpacking" : "packing" });
+      monitors.push(monitor);
+      return child;
+    };
+    try {
+      reader = launch(source, sourceCommand, false);
+      if (!failureError) writer = launch(destination, destinationCommand, true);
+      if (!failureError) {
+        reader.stdout.on("error", finish);
+        reader.stdout.on("data", chunk => { wireBytes += chunk.length; for (const monitor of monitors) monitor.receive(chunk); });
+        // pipe applies backpressure; archives/chunks never accumulate as a local file.
+        reader.stdout.pipe(writer.stdin);
+        reader.stdin.end(Buffer.from(paths.map(name => `${name}\0`).join(""), "utf8"));
+      }
+    } catch (error) { finish(error); }
+    starting = false;
+    finish();
   });
 }
 
@@ -1757,6 +1780,10 @@ async function transferChunkedServerFile(source, destination, name, timeoutMs, o
     const receive = decode + chunkTransferCommand(destination, { ...request, mode: "receiveChunks", offset });
     const sourceCommand = `bash -o pipefail -c ${shellQuote(read)}`;
     const destinationCommand = `bash -o pipefail -c ${shellQuote(receive)}`;
+    if (process.platform === "darwin") {
+      await relayTarFilesCore(source, destination, [name], timeoutMs, { ...options, sourceCommand, destinationCommand });
+      return;
+    }
     const direct = `bash -o pipefail -c ${shellQuote(`${read} | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port} ${shellQuote(`${destination.username}@${destination.host}`)} ${shellQuote(destinationCommand)}`)}`;
     try { await runRemoteBatchSsh(source, direct, [], timeoutMs, { ...options, stage: options.compression === "none" ? "分块传输" : "压缩分块传输" }); }
     catch (error) {
@@ -1807,6 +1834,14 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
           if (failed) return;
           completed += 1;
           completedFiles += 1;
+          report("done", index + 1, group);
+          continue;
+        }
+        if (process.platform === "darwin") {
+          await relayTarFilesCore(source, destination, group, timeoutMs, { ...options, transferId });
+          if (failed) return;
+          completed += 1;
+          completedFiles += group.length;
           report("done", index + 1, group);
           continue;
         }
@@ -6558,6 +6593,8 @@ module.exports = {
     compressionHistory,
     partitionTransferPaths,
     transferPartitionedTar,
+    transferPartitionedTarCore,
+    relayTarFilesCore,
     transferChunkedServerFile,
     transferErrorLog,
     syncServerToServerFpsyncCore,
