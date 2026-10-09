@@ -18,8 +18,8 @@ const { READ_ONLY_SETTLEMENT_METHODS, clientRequestKey, retryIdentity, localTran
 let transferRecoveryTestHooks = null;
 const transferRecoveries = new Map();
 const { execFile, spawn } = require("child_process");
-const { resolveWorkspaceLocation, localPathText, remotePathText } = require("./workspace-path.js");
-const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
+const { resolveWorkspaceLocation, normalizeMacRelativePath, localPathText, remotePathText } = require("./workspace-path.js");
+const { toTarPath: tarEntryPath, validateTarEntries, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
 const {
   HostOperationLeaseConflictError,
@@ -803,7 +803,8 @@ function directSyncTarget(value, label) {
 }
 
 function directSyncRelativePath(value) {
-  const relative = String(value || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  const relative = process.platform === "darwin" ? normalizeMacRelativePath(value, "Plan 产物相对路径")
+    : String(value || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
   if (Buffer.byteLength(relative, "utf8") > 4096 || /[:\0\r\n]/.test(relative)) throw new Error("Plan 产物相对路径不安全。");
   if (!relative || relative.startsWith("/") || relative.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Plan 产物相对路径不安全。");
   if (relative.split("/").some((part) => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) throw new Error("路径保留给 SimpleSFTP 传输暂存使用。");
@@ -2691,8 +2692,11 @@ async function writeRemoteCodeSyncState(sftp, state, manifest) {
 }
 
 function isSafeRemoteManagedPath(relativePath) {
+  if (process.platform === "darwin") {
+    try { relativePath = normalizeMacRelativePath(relativePath); } catch { return false; }
+  }
   const normalized = toPosixPath(relativePath).replace(/^\/+/, "");
-  if (!normalized || normalized.includes("..") || path.posix.isAbsolute(normalized)) return false;
+  if (!normalized || (process.platform !== "darwin" && normalized.includes("..")) || path.posix.isAbsolute(normalized)) return false;
   if (/[\\]|\0/.test(normalized)) return false;
   const segments = normalized.toLowerCase().split("/");
   const top = segments[0];
@@ -2705,6 +2709,7 @@ function isSafeRemoteManagedPath(relativePath) {
 }
 
 function sanitizeRelativeUploadPath(value) {
+  if (process.platform === "darwin") return normalizeMacRelativePath(value, "非法远端相对路径：");
   const normalized = toPosixPath(String(value || "").replace(/^\/+/, ""));
   if (!normalized || normalized.includes("..") || path.posix.isAbsolute(normalized)) {
     throw new Error(`非法远端相对路径：${value}`);
@@ -2788,6 +2793,7 @@ const METRIC_DOWNLOAD_EXTENSIONS = new Set([".csv", ".json", ".md", ".txt", ".lo
 const WEIGHT_DOWNLOAD_EXTENSIONS = new Set([".pt", ".pth", ".ckpt", ".safetensors", ".bin", ".onnx", ".pkl", ".pickle"]);
 
 function normalizeMappedRelativePath(value, label) {
+  if (process.platform === "darwin") return normalizeMacRelativePath(value, label);
   const raw = toPosixPath(String(value || "").trim());
   if (!raw || raw === "." || raw.startsWith("/") || /^[A-Za-z]:/.test(raw) || path.win32.isAbsolute(String(value || "").trim())) {
     throw new Error(`${label}必须是项目内相对文件路径：${value}`);
@@ -2867,7 +2873,7 @@ function normalizeMappedDownloadEntries(options = {}) {
     const remotePath = normalizeMappedRelativePath(item.remotePath, "远端路径");
     const localRelativePath = normalizeMappedRelativePath(item.localRelativePath, "本机相对路径");
     rejectMappedDownloadKind(remotePath, options);
-    const remoteKey = remotePath.toLowerCase();
+    const remoteKey = remotePath;
     const localKey = localRelativePath.toLowerCase();
     if (seenRemote.has(remoteKey)) throw new Error(`映射下载远端路径重复：${remotePath}`);
     if (seenLocal.has(localKey)) throw new Error(`映射下载本机路径重复：${localRelativePath}`);
@@ -5165,6 +5171,7 @@ function getWorkspaceFolderForFile(filePath) {
 
 function runLocalTarUpload(options) {
   const plan = options.uploadPlan || createWorkspaceUploadPlan(options.localPath, options.sftp);
+  validateTarEntries(plan.files, process.platform);
   return withFileResourceLease(options.operation || "批量上传", options.sftp.remotePath,
     plan.files.map(file => file.relativePath), remoteResourceServer(options.sftp),
     () => withTransferCapacity({ server: options.sftp }, () => runLocalTarUploadCore({ ...options, uploadPlan: plan })));
@@ -5173,7 +5180,8 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
   getSshArgs(sftp, remoteCommand);
   const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
-  const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath)).join("\n")}\n`;
+  validateTarEntries(plan.files, process.platform);
+  const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath, process.platform)).join("\n")}\n`;
   const chunkedChecksum = hashUploadPlanChunks(plan.files);
   const startedAt = Date.now();
   const upload = new Promise((resolve, reject) => {
@@ -5285,7 +5293,7 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
           reportedPercent = percent;
         }
       }
-    } })
+    }, platform: process.platform })
       .then(() => sshProc.stdin.end())
       .catch(fail);
     sshProc.on("close", (code, signal) => {
@@ -5628,13 +5636,14 @@ function createMappedDownloadScript() {
     "total_size=0",
     "seen=set()",
     "for item in files:",
-    "    rel=str(item.get('remotePath') or '').replace('\\\\','/').strip('/')",
+    "    rel=item.get('remotePath')",
+    "    if not isinstance(rel,str) or not rel or len(rel.encode('utf-8')) > 4096 or any(ord(c) < 32 or ord(c) == 127 or c in (':',chr(92)) for c in rel): fail('unsafe remote path')",
     "    archive=str(item.get('archiveName') or '')",
     "    parts=[part for part in rel.split('/') if part]",
     "    if not rel or rel != '/'.join(parts) or any(part in ('.','..') for part in parts): fail('unsafe remote path: '+rel)",
     "    if not archive.startswith('mapped/') or '/' in archive[7:] or not archive[7:].isdigit(): fail('unsafe archive name')",
-    "    if rel.lower() in seen: fail('duplicate remote path: '+rel)",
-    "    seen.add(rel.lower())",
+    "    if rel in seen: fail('duplicate remote path: '+rel)",
+    "    seen.add(rel)",
     "    cursor=root",
     "    for part in parts:",
     "        cursor=os.path.join(cursor, part)",
@@ -5980,7 +5989,7 @@ function parseMappedTarHeader(block) {
 }
 
 function readTarField(block, offset, length) {
-  return block.subarray(offset, offset + length).toString("utf8").replace(/\0.*$/, "").trim();
+  return block.subarray(offset, offset + length).toString("utf8").split("\0", 1)[0];
 }
 
 function writeStreamChunk(stream, chunk) {

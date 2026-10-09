@@ -3,20 +3,18 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { Buffer } = require("node:buffer");
+const { normalizeMacRelativePath } = require("./workspace-path");
 
 const BLOCK_SIZE = 512;
 
-async function writeTarEntriesToStream({ localPath, files, stream, onFileBytes }) {
+async function writeTarEntriesToStream({ localPath, files, stream, onFileBytes, platform = process.platform }) {
   if (!Array.isArray(files)) throw new TypeError("files must be an array");
   if (!stream || typeof stream.write !== "function") throw new TypeError("stream is required");
 
+  const paths = validateTarEntries(files, platform);
   const seenDirectories = new Set(["."]);
-  for (const file of files) {
-    const rawPath = String(file.relativePath || "").replace(/\\/g, "/");
-    const relativePath = toTarPath(rawPath);
-    if (!relativePath || /[:\0\r\n]/.test(rawPath) || rawPath.startsWith("/") || rawPath.split("/").some(part => !part || part === "." || part === "..")) {
-      throw new Error(`上传清单包含不安全路径：${file.relativePath}`);
-    }
+  for (const [index, file] of files.entries()) {
+    const relativePath = paths[index];
     for (const directory of ancestorPaths(relativePath)) {
       if (seenDirectories.has(directory)) continue;
       seenDirectories.add(directory);
@@ -31,6 +29,22 @@ async function writeTarEntriesToStream({ localPath, files, stream, onFileBytes }
     } else await writeLocalFileEntry(stream, localPath, relativePath, file.fullPath || path.join(localPath, relativePath), onFileBytes);
   }
   await write(stream, Buffer.alloc(BLOCK_SIZE * 2));
+}
+
+function validateTarEntries(files, platform = process.platform) {
+  if (!Array.isArray(files)) throw new TypeError("files must be an array");
+  const seen = new Set();
+  return files.map(file => {
+    const rawPath = platform === "darwin" ? file.relativePath : String(file.relativePath || "").replace(/\\/g, "/");
+    const relativePath = toTarPath(rawPath, platform);
+    if (!relativePath || (platform !== "darwin" && (/[:\0\r\n]/.test(rawPath) || rawPath.startsWith("/") || rawPath.split("/").some(part => !part || part === "." || part === "..")))) {
+      throw new Error(`上传清单包含不安全路径：${file.relativePath}`);
+    }
+    if (Buffer.isBuffer(file.content) && file.content.length > 2 * 1024 * 1024) throw new Error("上传生成数据超过 2MiB 上限");
+    if (seen.has(relativePath)) throw new Error(`上传清单包含重复路径：${relativePath}`);
+    seen.add(relativePath);
+    return relativePath;
+  });
 }
 
 async function writeLocalDirectoryEntry(stream, localPath, relativePath) {
@@ -215,7 +229,8 @@ async function write(stream, chunk) {
   }
 }
 
-function toTarPath(value) {
+function toTarPath(value, platform = process.platform) {
+  if (platform === "darwin") return normalizeMacRelativePath(value, "上传清单路径");
   return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/^(\.\.\/)+/, "").replace(/\/+$/, "");
 }
 
@@ -237,6 +252,7 @@ module.exports = {
   splitUstarName,
   tarHeader,
   toTarPath,
+  validateTarEntries,
   ustarHeader,
   writeTarEntriesToStream,
 };

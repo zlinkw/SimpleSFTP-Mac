@@ -23,6 +23,8 @@ function extractFunction(name) {
 
 function createPlanSandbox(rootPath) {
   return {
+    process,
+    ...require("../workspace-path"),
     fs,
     path,
     crypto,
@@ -194,7 +196,7 @@ test("managed state uses simple_cluster and reports legacy directories for manua
 
 test("managed manifest trusts caller-selected data files while retaining path safety", () => {
   const localPath = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-data-manifest-"));
-  const sandbox = { fs, path, vscode: { window: { showWarningMessage() {} } }, toPosixPath: (value) => String(value).replace(/\\/g, "/") };
+  const sandbox = { fs, path, process, ...require("../workspace-path"), vscode: { window: { showWarningMessage() {} } }, toPosixPath: (value) => String(value).replace(/\\/g, "/") };
   vm.createContext(sandbox);
   vm.runInContext([
     source.slice(source.indexOf("function getManagedManifest("), source.indexOf("function getMissingManagedFiles(")),

@@ -80,6 +80,8 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
   assert.ok(uploadStart >= 0 && uploadEnd > uploadStart);
   let disposed = false, child;
   const sandbox = {
+    process,
+    validateTarEntries: require("../tar-writer").validateTarEntries,
     Date,
     Promise,
     clearTimeout,

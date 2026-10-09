@@ -66,6 +66,16 @@ function remotePathText(value, platform = process.platform, allowRoot = false) {
   return value == null || value === "" ? "" : normalizeMacAbsolutePath(value, "远端路径", allowRoot);
 }
 
+function normalizeMacRelativePath(value, label = "相对路径", allowProjectRoot = false) {
+  if (typeof value !== "string" || !value || value.startsWith("/") || /[:\x00-\x1f\x7f\\]/.test(value)
+    || Buffer.byteLength(value, "utf8") > 4096) throw new Error(`${label}必须是安全的项目内 POSIX 相对路径。`);
+  const normalized = value.replace(/^\.\//, "").replace(/\/+$/, "");
+  if (allowProjectRoot && (normalized === "." || value === "./")) return ".";
+  if (!normalized || normalized.split("/").some(part => !part || part === "." || part === ".."))
+    throw new Error(`${label}包含越界或空路径段。`);
+  return normalized;
+}
+
 function normalizeWindowsAbsolutePath(value, label) {
   const raw = String(value || "").trim();
   if (!/^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\")) {
@@ -124,4 +134,4 @@ function isEscapingRelativePath(value, api) {
   return value === ".." || value.startsWith(`..${api.sep}`) || api.isAbsolute(value);
 }
 
-module.exports = { resolveWorkspaceLocation, normalizeMacAbsolutePath, localPathText, remotePathText };
+module.exports = { resolveWorkspaceLocation, normalizeMacAbsolutePath, normalizeMacRelativePath, localPathText, remotePathText };
