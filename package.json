@@ -2,7 +2,7 @@
 	"name": "simple-sftp-mac",
 	"displayName": "SimpleSFTP Mac",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-	"version": "0.2.88",
+	"version": "0.2.89",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
