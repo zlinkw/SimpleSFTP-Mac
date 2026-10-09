@@ -127,6 +127,8 @@ CLI 业务 RPC 自动读取当前 Mac 发现文件和 `/api/v1/capabilities`，�
 
 科研 Plan 通过配套 `simpleex-mac experiment run` 申请标准路线，SimpleSFTP 保持传输职责。CLI 与 VS Code 的项目必须一致，在线路线检查通过后仍需 VS Code 人工确认；`requested: true`、`submitted: false`、`waiting_confirmation` 是等待确认回执，使用返回的 `operationId` 与实时 `operations.list` 查看后续状态。[Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md) 提供完整路径与预检示例；离线 `local_only` 不能作为科研就绪证明。
 
+配套 Mac 服务端在准备、校验及提交关键边界核对当前真实工作区；项目变化后重新预检，活动 Plan 不通过旧自动停止 fallback 中断。正式种子配置在保存的 Plan `seeds` 中，在线 Plan CLI 的 `--seed` 和 workflow API 的 `seed` 覆盖参数会拒绝；离线预览只返回 `seedApplied: false`。这些检查通过本地模拟，真实科研仍待验收。
+
 ## 发布与验收
 
 两仓验证、提交并同步 origin/master 后，在 SimpleExperiment-Mac 执行 `npm run release:prepare`、`npm run release:publish`。release.json 绑定两仓提交，核验全部附件后发布，已发布版本不可覆盖。不使用 GitHub Actions，不自动安装开发机扩展。
