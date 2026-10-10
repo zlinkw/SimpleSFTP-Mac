@@ -111,7 +111,7 @@ Mac 跨服务器传输分别认证两端，默认经本机 SSH 流式中转，�
 
 下载与缓存复用核对真实路径、大小和 SHA-256。出现来源冲突、无效 UTF8 或“本机映射路径拼写与已有磁盘条目不一致”时，查看实际目录/文件名并重新确认目标；不要删空格、改大小写或强制覆盖借用别的文件。更新不会自动升级服务器 Agent，需在 SimpleExperiment Mac 的 **准备项目与 Agent**主动确认上传，再在 Termius 手动处理并 **检测全部**，保留正在运行的实验。
 
-归档证据由 SimpleExperiment Mac 读取：旧条目只有明确属于同一原始 Plan、所请求 revision 且产物键匹配时才进入最终统计，身份不足的结果保留在预览。归档写入、跨 Plan 聚合和 M5 尚未验收。解析按钮、YAML 路径示例与处理步骤见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md#mac-结果路径与来源)。
+归档证据由 SimpleExperiment Mac 读取：旧条目只有明确属于同一原始 Plan、所请求 revision 且产物键匹配时才进入最终统计，身份不足的结果保留在预览。项目表还会从受检原始 CSV 和当前归档重计算校验；预览种子表保留完整记录，最终表仅使用当前归档记录。项目聚合不符时，在结果区选择报错的完整 Plan 重新解析后再同步。完整归档执行、项目聚合发布和 M5 尚未验收。解析按钮、YAML 路径示例与处理步骤见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md#mac-结果路径与来源)。
 
 ## 数据目录与 API
 
