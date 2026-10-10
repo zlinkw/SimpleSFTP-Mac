@@ -48,8 +48,29 @@ async function localTransferExitProof(instanceId, allowCurrentOwner = false) {
   // A missing child count, elapsed time, or a Windows kill(pid, 0) exception
   // cannot establish that an abandoned transport has exited.
   const match = /^([1-9][0-9]{0,9}):/.exec(String(instanceId));
-  if (process.platform !== "win32" || !match) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+  if (!match) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
   const oldPid = Number(match[1]);
+  if (process.platform === "darwin") {
+    if (!Number.isSafeInteger(oldPid) || oldPid > 2147483647) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+    const output = await new Promise((resolve, reject) => execFile("/bin/ps", ["-ax", "-o", "pid=,comm="],
+      { windowsHide: true, timeout: 6000, maxBuffer: 512 * 1024, encoding: "utf8" },
+      (error, stdout) => error ? reject(new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE")) : resolve(stdout)));
+    if (typeof output !== "string" || Buffer.byteLength(output) > 512 * 1024 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffd]/.test(output)) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+    const rows = [], pids = new Set();
+    for (const line of output.split(/\r?\n/).filter(line => line.trim())) {
+      const row = /^\s*([1-9][0-9]*)\s+(.+?)\s*$/.exec(line);
+      const pid = row && Number(row[1]);
+      if (!row || !Number.isSafeInteger(pid) || pid > 2147483647 || pids.has(pid)) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+      pids.add(pid); rows.push({ pid, name: path.posix.basename(row[2]) });
+    }
+    // A missing current owner means the native snapshot is incomplete, not idle.
+    if (!pids.has(process.pid)) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+    const transport = /^(ssh|scp|sftp|rsync|tar|gzip|pigz|zstd)$/i;
+    if (rows.some(row => transport.test(row.name) || row.pid === oldPid && !(allowCurrentOwner && oldPid === process.pid)))
+      throw new Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE");
+    return { localOwnerExited: oldPid !== process.pid, localTransportCount: 0 };
+  }
+  if (process.platform !== "win32") throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
   const command = `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $items=@(Get-CimInstance Win32_Process -Filter \"ProcessId=${oldPid} OR Name='ssh.exe' OR Name='scp.exe' OR Name='sftp.exe' OR Name='plink.exe' OR Name='rsync.exe' OR Name='tar.exe' OR Name='gzip.exe' OR Name='pigz.exe' OR Name='zstd.exe'\"); ConvertTo-Json -Compress -InputObject @($items | Select-Object ProcessId,Name)`;
   const output = await new Promise((resolve, reject) => execFile("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", command],
     { windowsHide: true, timeout: 6000, maxBuffer: 32768, encoding: "utf8" }, (error, stdout) => error ? reject(new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE")) : resolve(stdout)));
