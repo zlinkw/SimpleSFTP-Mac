@@ -147,6 +147,8 @@ Plan 目录默认为 `experiments/plans`，在 Mac 设置 `simpleExperimentMac.p
 
 Agent 持久队列的 Plan/outputDir 身份、接收回执、旧队列派发及 recall/停止匹配也保留真实大小写、Unicode、字面 %20 和首尾空格；非法相对路径或非字符串不自动改写后接收。旧 queued 行的坏路径会等待处理，运行中记录不自动修改。该检查需服务器使用配套新版 Agent：更新扩展后，通过“准备项目与 Agent”核对并确认上传，在 Termius 手动启动后再检测；不要为升级中断已有实验。Agent 启动参数与 scheduler 的输出、attempt 子目录、工作目录、声明输入/输出及 Plan 状态 key 同样保留真实拼写。Plan 必须是项目内现有普通文件；已有路径条目按实际名称核对，符号链接、别名冲突和非法路径会在启动前拒绝。依赖检测后再次检查路径与原 Plan revision；原 Plan 读取全文，不受摘要预算限制。以上仅通过隔离编译函数和模拟 POSIX 文件系统验证；检查到实际启动/写入之间仍有变化窗口，结果/归档写入、真实科研与 M5 继续适配。出现路径身份冲突时核对原 Plan、完整回执和远端状态，不盲目重发。
 
+配套结果区选择完整 Plan，使用 **运行质量门禁 → 运行统计 → 导出论文表格**。当前原始 CSV/配置/归档重新核对；来源身份或行集合变化时先重新解析该 Plan，再手动同步需要的来源，不通过修改指标缓存或归档 JSON 绕过检查。完整写入原子性与 M5 仍待验收。
+
 结果契约、解析、摘要与旧归档证据的详细规则见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md#mac-结果路径与来源)。本地编译/模拟 API/隔离 Agent 验证不代表真实传输、完整科研或 M5 验收。
 
 ## 发布与验收
