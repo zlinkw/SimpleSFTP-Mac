@@ -11,7 +11,7 @@ const run = (command, args, timeout = 10000) => {
 };
 for (const file of pkg.files.filter(file => file.endsWith(".js"))) run(process.execPath, ["--check", file]);
 run("python", ["-B", "-X", "utf8", "scripts/verify-python.py", ...pkg.files.filter(file => file.endsWith(".py"))]);
-const included = new Set(run(process.execPath, [require.resolve("@vscode/vsce/vsce"), "ls", "--no-dependencies"], 8000).split(/\r?\n/));
+const included = new Set(run(process.execPath, [require.resolve("@vscode/vsce/vsce"), "ls", "--no-dependencies"], 30000).split(/\r?\n/));
 for (const file of pkg.files) assert.ok(included.has(file), `VSIX missing ${file}`);
 for (const file of included) assert.ok(!/node_modules|__pycache__|\.pyc$|(^|\/)test\//.test(file), `Unexpected runtime file ${file}`);
 for (const file of pkg.files.filter(file => file.endsWith(".js"))) {

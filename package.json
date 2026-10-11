@@ -43,7 +43,9 @@
     "mac-update-gate.js",
     "mac-auth.js",
     "mac-ssh-askpass.js",
-    "mac-ssh-askpass.sh"
+    "mac-ssh-askpass.sh",
+    "cleanup-file-api.js",
+    "cleanup-files.py"
   ],
   "engines": {
     "vscode": "^1.80.0"

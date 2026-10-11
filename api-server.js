@@ -185,7 +185,7 @@ class LocalApiServer {
         return;
       }
       const controller = new AbortController();
-      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method);
+      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method);
       const cancelRead = () => { if (readOnly) controller.abort(new Error("API_READ_CANCELLED")); };
       request.on("aborted", cancelRead); response.on("close", cancelRead);
       if (request.aborted || response.destroyed) cancelRead();
@@ -447,6 +447,7 @@ class LocalApiServer {
     const methods = Object.keys(this.methods).sort();
     return {
       openapi: "3.0.0",
+      "x-simple-method-options": this.methodOptions,
       info: {
         title: `${this.name} Local API`,
         version: this.version,
