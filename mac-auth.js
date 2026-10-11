@@ -70,10 +70,10 @@ class MacAuthentication {
     await new Promise((resolve, reject) => { this.server.once("error", reject); this.server.listen(0, "127.0.0.1", resolve); });
     this.server.unref();
   }
-  invocation(target) {
+  invocation(target, options = {}) {
     if (this.disposed || !this.server?.listening) throw Error("Mac 认证服务尚未就绪。");
     const id = identity(target), config = this.config(target), nonce = crypto.randomBytes(32).toString("hex");
-    this.sessions.set(nonce, { id, config, attempts: {}, active: true });
+    this.sessions.set(nonce, { id, config, attempts: {}, active: true, onCancel: options.onCancel });
     const env = { ...process.env, SSH_ASKPASS: path.join(__dirname, "mac-ssh-askpass.sh"), SSH_ASKPASS_REQUIRE: "force", DISPLAY: process.env.DISPLAY || ":0",
       ELECTRON_RUN_AS_NODE: "1", SIMPLE_SFTP_NODE: process.execPath, SIMPLE_SFTP_HELPER: path.join(__dirname, "mac-ssh-askpass.js"),
       SIMPLE_SFTP_AUTH_PORT: String(this.server.address().port), SIMPLE_SFTP_AUTH_NONCE: nonce };
@@ -96,6 +96,10 @@ class MacAuthentication {
         session.attempts[kind] = (session.attempts[kind] || 0) + 1;
         if (!kind || session.attempts[kind] > 3) throw Error("unsupported prompt");
         const value = await this.secret(session, kind, prompt, session.attempts[kind] > 1);
+        if (value === undefined && session.active && !this.disposed) {
+          session.active = false;
+          try { session.onCancel?.(); } catch {}
+        }
         if (!session.active || this.disposed || response.destroyed || value === undefined) { deny(); return; }
         response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }); response.end(value);
       } catch { deny(); }

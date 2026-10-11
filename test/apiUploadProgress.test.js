@@ -81,6 +81,7 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
   let disposed = false, child;
   const sandbox = {
     process,
+    macAuthentication: undefined,
     validateTarEntries: require("../tar-writer").validateTarEntries,
     Date,
     Promise,
@@ -112,7 +113,10 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
     },
   };
   vm.createContext(sandbox);
-  vm.runInContext(`${source.slice(uploadStart, uploadEnd)}\nthis.upload = runLocalTarUpload;`, sandbox);
+  const authStart = source.indexOf("async function ensureMacTransferAuthentication(");
+  const authEnd = source.indexOf("function authenticatedSsh(", authStart);
+  assert.ok(authStart >= 0 && authEnd > authStart);
+  vm.runInContext(`${source.slice(authStart, authEnd)}\n${source.slice(uploadStart, uploadEnd)}\nthis.upload = runLocalTarUpload;`, sandbox);
   await assert.rejects(sandbox.upload({
     localPath: "C:/project",
     sftp: { remotePath: "/project" },

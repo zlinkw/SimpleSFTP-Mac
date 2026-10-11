@@ -62,6 +62,7 @@ function harness(options = {}) {
   } });
   api.setRemoteBatchTransport((target, command, paths, timeout, request) => {
     controls.push({ target, command, paths, timeout, request });
+    if (command === "printf %s SIMPLE_SFTP_AUTH_READY") return "SIMPLE_SFTP_AUTH_READY";
     return options.control ? options.control(target, command, paths, request) : JSON.stringify({ offset: 8 * 1024 * 1024, chunkBytes: 8 * 1024 * 1024 });
   });
   return { api, calls, controls, sessions, leases, data };
@@ -90,7 +91,9 @@ test("actual Mac fpsync compares both inventories, streams only changed Chinese 
     return JSON.stringify({ files: { [name]: { sha256: target.host === source.host || final ? hash : "c".repeat(64), size: 7 }, [unchanged]: { sha256: steady, size: 5 } }, cacheHits: 0, cacheRehash: 2, digestReads: 2, cacheQueries: 2 });
   } });
   const result = await h.api.syncServerToServerFpsyncCore({ source, destination, relativePaths: [name, unchanged], compression: "none", confirm: true, pathConfirmed: true, apiMode: true }, { report() {} });
-  assert.equal(result.ok, true); assert.equal(h.controls.length, 3); assert.equal(destinationReads, 2);
+  assert.equal(result.ok, true); assert.equal(h.controls.length, 5); assert.equal(destinationReads, 2);
+  assert.deepEqual(h.controls.slice(0, 2).map(row => row.target.host), [source.host, destination.host]);
+  assert.ok(h.controls.slice(0, 2).every(row => row.request.remoteMutation === false));
   assertIndependentConnections(h);
   assert.match(h.calls[0].args.at(-1), /realpath -e/);
   assert.match(h.calls[0].args.at(-1), /pwd -P/);

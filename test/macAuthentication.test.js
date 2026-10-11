@@ -117,6 +117,22 @@ test("real Node askpass helper reads only the scoped IPC credential and exits wi
   } finally { await manager.dispose(); }
 });
 
+test("cancelling a secure prompt signals only its own SSH invocation once and never reprompts", async () => {
+  let prompts = 0, cancelled = 0;
+  const manager = new MacAuthentication(context(), { showInputBox: async () => { prompts++; return undefined; } });
+  await manager.start();
+  try {
+    const request = manager.invocation(target(), { onCancel: () => cancelled++ });
+    const other = manager.invocation(target("other.example.org"));
+    assert.equal((await ask(request, "scientist@worker.example.org's password: ")).status, 403);
+    assert.equal(cancelled, 1); assert.equal(prompts, 1);
+    assert.equal((await ask(request, "scientist@worker.example.org's password: ")).status, 403);
+    assert.equal(cancelled, 1); assert.equal(prompts, 1);
+    assert.equal(manager.sessions.get(other.env.SIMPLE_SFTP_AUTH_NONCE).active, true);
+    assert.equal(manager.memory.size, 0);
+  } finally { await manager.dispose(); }
+});
+
 test("actual SSH process wrappers bind both relay identities and keep successful contexts until close", async () => {
   const Module = require("node:module"), original = Module._load;
   Module._load = function(name, ...args) { return name === "vscode" ? { TreeItem: class {} } : original.call(this, name, ...args); };

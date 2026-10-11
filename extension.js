@@ -1931,6 +1931,8 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     method: "sync.serverToServerFpsync", operation: "Worker 间分批打包同步", requires: ["confirm", "pathConfirmed"],
     source, destination, relativePath, relativePaths: requested, directory,
   });
+  await ensureMacTransferAuthentication(source, "来源", true);
+  await ensureMacTransferAuthentication(destination, "目标", true);
   const timeoutMs = transferTimeoutMs(source, options);
   let reportedPercent = 0;
   const advance = (percent, message) => {
@@ -3810,7 +3812,7 @@ async function reconcileTransferOperationCore(params) {
     || (row.operationInstanceId === currentTransferApiInstanceId() && !row.requestDone);
   if (hasLocalWork()) return receipt("outcomeUnknown", "旧传输本地请求/进程尚未退出");
   const method = String(params.retryMethod || "");
-  if (method !== "sync.serverToServerFpsync" && !READ_ONLY_SETTLEMENT_METHODS.includes(method)) return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
+  if (method !== "sync.serverToServerFpsync" && method !== "upload.files" && !READ_ONLY_SETTLEMENT_METHODS.includes(method)) return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
   let identity, source, destination;
   try {
     identity = retryIdentity(params.retryParams || {});
@@ -3821,6 +3823,12 @@ async function reconcileTransferOperationCore(params) {
     if (method === "sync.serverToServerFpsync") {
       source = directSyncTarget(identity.source, "旧传输来源");
       destination = directSyncTarget(identity.destination, "旧传输目标");
+    }
+    if (method === "upload.files") {
+      destination = resolveUploadSftp(localPathText(identity.localPath, process.platform), identity);
+      if (!identity.server?.host || !identity.server?.remotePath || !(identity.server.username || identity.server.user) || destination.host !== identity.server.host || destination.remotePath !== identity.server.remotePath || destination.username !== (identity.server.username || identity.server.user) || destination.port !== Number(identity.server.port || 22))
+        return receipt("identityMismatch", "旧上传缺少可核实的显式服务器目标");
+      destination = directSyncTarget(destination, "旧上传目标");
     }
   } catch { return receipt("identityMismatch", "无法证明旧传输的来源和目标"); }
   const commitExitProof = async (kind, proofs) => {
@@ -3852,7 +3860,8 @@ async function reconcileTransferOperationCore(params) {
       return await commitExitProof("verified-read-transfer-exit", []);
     } catch (error) { return receipt("outcomeUnknown", String(error?.message || error).slice(0, 200)); }
   }
-  const resources = [source, destination].map(target => ({ server: remoteResourceServer(target), project: target.remotePath, target: target.remotePath }));
+  const targets = method === "upload.files" ? [destination] : [source, destination];
+  const resources = targets.map(target => ({ server: remoteResourceServer(target), project: target.remotePath, target: target.remotePath }));
   let handle;
   const signal = currentApiRequestContext()?.signal;
   try {
@@ -3865,9 +3874,9 @@ async function reconcileTransferOperationCore(params) {
     const localProof = transferRecoveryTestHooks?.localProof || localTransferExitProof;
     await localProof(row.operationInstanceId, row.operationInstanceId === currentTransferApiInstanceId());
     const proofs = [];
-    for (const target of [source, destination]) {
+    for (const target of targets) {
       signal?.throwIfAborted();
-      const text = await runRemoteBatchSsh(target, settlementProbeCommand(target.remotePath, shellQuote), [], 20000,
+      const text = await runRemoteBatchSsh(target, settlementProbeCommand(target.remotePath, shellQuote, method === "upload.files" ? "plain-tar-v1" : "staged-tar-v1"), [], 20000,
         { remoteMutation: false, stage: "旧传输退出核实" });
       if (String(text).length > 4096) throw new Error("INVALID_REMOTE_EXIT_PROOF");
       const proof = JSON.parse(text);
@@ -3882,6 +3891,8 @@ async function reconcileTransferOperationCore(params) {
         const description = blocker ? ` pid=${blocker.pid} ${blocker.name} state=${blocker.state} scope=${blocker.scope}` : "";
         throw new Error(`REMOTE_TRANSFER_STILL_ACTIVE ${role}:${target.host}${description}`);
       }
+      if (method === "upload.files" && (proof.protocol !== "plain-tar-v1" || proof.unobservedExternalSessions?.length))
+        throw new Error("PLAIN_UPLOAD_EXIT_PROOF_UNAVAILABLE");
       if (proof.idle !== true || proof.root !== target.remotePath || !Number.isSafeInteger(proof.inspectedProcesses)
           || proof.inspectedProcesses < 0 || proof.inspectedProcesses > 8192 || !Number.isSafeInteger(proof.inspectedLocks)
           || proof.inspectedLocks < 0 || proof.inspectedLocks > 32) throw new Error(proof.reason || "INVALID_REMOTE_EXIT_PROOF");
@@ -4454,9 +4465,21 @@ function createLocalApiMethods() {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
       const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
-      const recoveryContext = name === "sync.serverToServerFpsync" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
+      const recoveryContext = name === "sync.serverToServerFpsync" || name === "upload.files" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
         ? { method: name, params: retryIdentity(params) } : undefined;
-      await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
+      const requestKey = params._requestKey || transferRequestKey(name, params);
+      try {
+        await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, requestKey, recoveryContext);
+      } catch (error) {
+        // A new, explicitly confirmed request may obtain an authoritative exit
+        // receipt for its exact old blocker. Never replay the old upload or unlock
+        // by child count, elapsed time, SSH 255, or a failed probe.
+        if (name !== "upload.files" || params.confirm !== true || params.pathConfirmed !== true || !error?.apiData?.blockedOperationId) throw error;
+        const recovered = await reconcileTransferOperation({ operationId: error.apiData.blockedOperationId,
+          operationInstanceId: error.apiData.operationInstanceId, requestKey, retryMethod: name, retryParams: params });
+        if (!recovered.settled) { error.apiData.reconciliation = recovered; throw error; }
+        await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, requestKey, recoveryContext);
+      }
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
       controller.operationId = operationId;
       try {
@@ -5203,11 +5226,12 @@ function runLocalTarUpload(options) {
     plan.files.map(file => file.relativePath), remoteResourceServer(options.sftp),
     () => withTransferCapacity({ server: options.sftp }, () => runLocalTarUploadCore({ ...options, uploadPlan: plan })));
 }
-function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
+async function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
   getSshArgs(sftp, remoteCommand);
   const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
   validateTarEntries(plan.files, process.platform);
+  await ensureMacTransferAuthentication(sftp, "上传目标");
   const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath, process.platform)).join("\n")}\n`;
   const chunkedChecksum = hashUploadPlanChunks(plan.files);
   const startedAt = Date.now();
@@ -6448,11 +6472,30 @@ function getSshArgs(sftp, command) {
   return args;
 }
 
+async function ensureMacTransferAuthentication(target, role, wholeRequestNotStarted = false) {
+  if (!macAuthentication) return;
+  const controller = transferContext.getStore();
+  controller?.updateProgress?.({ phase: "authenticating" });
+  try {
+    const result = await runRemoteBatchSsh(target, "printf %s SIMPLE_SFTP_AUTH_READY", [], 20000,
+      { remoteMutation: false, stage: `${role}认证` });
+    if (result !== "SIMPLE_SFTP_AUTH_READY") throw new Error("认证回执无效");
+  } catch (error) {
+    const failure = new Error(`${role} SSH 认证未完成（${target.username || target.user || ""}@${target.host}:${target.port || 22}）：${String(error?.message || error)}`);
+    failure.code = "SSH_AUTHENTICATION_NOT_READY";
+    failure.apiData = { ...(wholeRequestNotStarted ? { notStarted: true } : {}), currentBatchNotStarted: true, phase: "authentication", role };
+    failure.exitCode = error?.exitCode;
+    failure.stage = `${role}认证`;
+    throw failure;
+  }
+}
+
 function authenticatedSsh(sftp, command, options, launch, extra = []) {
   const args = getSshArgs(sftp, command);
-  const auth = macAuthentication?.invocation(sftp);
+  let child;
+  const auth = macAuthentication?.invocation(sftp, { onCancel: () => child?.kill() });
   try {
-    const child = launch("ssh", [...(auth ? [] : extra), ...args], auth ? { ...options, env: auth.env } : options);
+    child = launch("ssh", [...(auth ? [] : extra), ...args], auth ? { ...options, env: auth.env } : options);
     if (auth) { child.once("close", auth.release); child.once("error", auth.release); }
     return child;
   } catch (error) { auth?.release(); throw error; }
@@ -6621,6 +6664,8 @@ module.exports = {
     spawnSsh,
     getSshArgs,
     setMacAuthentication: value => { macAuthentication = value; },
+    ensureMacTransferAuthentication,
+    runLocalTarUploadCore,
     addTarExcludePattern,
     apiTransferSftp,
     createListRemoteDirsSshArgs,
