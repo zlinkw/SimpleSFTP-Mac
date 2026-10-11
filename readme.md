@@ -21,6 +21,8 @@ SimpleSFTP Mac 是 Apple Silicon Mac 的 VS Code 文件传输扩展，与 [Simpl
 
 ## 更新按钮入口
 
+本轮配套同步Windows分叉后的受限PLAN清理接口：由SimpleExperiment Mac的Plan区“清除 PLAN 及关联产物”进入，只读预览精确目标、身份与未完成节点，再按页面确认。独立认证、共享租约和传输退出证明继续保留。macOS尚缺可靠打开文件句柄证明，实际清理返回`HANDLE_CHECK_UNAVAILABLE`并阻断，不可通过其他入口绕过；永久删除仍需两次完整路径确认。参考提交与边界见[功能同步说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-sync-2026-10-12.md)。
+
 | 入口 | 操作 |
 | --- | --- |
 | **底部右侧状态栏** | 点击 **Mac preview：…**，检查配套更新。 |
