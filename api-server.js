@@ -425,7 +425,7 @@ class LocalApiServer {
       version: this.version,
       instanceId: this.instanceId(),
       features: { transferSettlementReceipts: true,
-        ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true,
+        ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true, transferReconciliationStoredIdentity: true,
           transferReconciliationMethods: ["sync.serverToServerFpsync", "upload.files", ...READ_ONLY_SETTLEMENT_METHODS] } : {}),
         ...(this.methodOptions["sync.projectInventory"]?.scopeTransport === "stdin" ? { projectInventoryStdinScopes: true } : {}) },
       transport: ["http", "cli"],

@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict"), test = require("node:test"), Module = require("node:module");
 const { spawnSync } = require("node:child_process");
-const { clientRequestKey, assertLocalProcessesIdle, settlementProbeCommand } = require("../transfer-settlement");
+const { clientRequestKey, retryIdentity, assertLocalProcessesIdle, settlementProbeCommand } = require("../transfer-settlement");
 const originalLoad = Module._load;
 Module._load = function(request, ...args) {
   return request === "vscode" ? { TreeItem: class {}, ProgressLocation: { Notification: 1 },
@@ -78,7 +78,8 @@ test("changed read target or a live child cannot be cleared by read-only recover
 function fixture(options = {}) {
   const values = new Map([[ledgerKey, options.noLegacy ? [] : [{ operationId: "legacy-op", operationInstanceId: "123:old", status: "outcomeUnknown",
     startedAt: new Date().toISOString(), reason: "process closed without authoritative remote exit status (SIGTERM)",
-    remoteMutation: true, requestKey: key }]]]);
+    remoteMutation: true, requestKey: key,
+    ...(options.withContext ? { recoveryContext: { method, params: retryIdentity(params) } } : {}) }]]]);
   const order = [];
   const globalState = { get: (name, fallback) => values.get(name) || fallback,
     async update(name, value) { if (options.failPersistence) throw Error("disk locked"); await options.onWrite?.(); values.set(name, structuredClone(value)); } };
@@ -120,6 +121,23 @@ test("legacy SIGTERM receipt blocks first, then proven exit permits one fresh di
   assert.equal(state.settledOperations.length, 2);
   __test.setTransferSettlementTestContext({ globalState: { get: (name, fallback) => f.values.get(name) || fallback }, instanceId: "789:next" });
   assert.equal((await __test.listTransferOperationState()).settledOperations[0].recovery.kind, "verified-writer-exit");
+});
+
+test("official recovery by original ID and instance uses verified durable endpoints without replay", async () => {
+  const f = fixture({ withContext: true });
+  assert.equal((await f.reconcile({ retryMethod: undefined, retryParams: undefined, requestKey: undefined })).settled, true);
+  assert.deepEqual(f.order, ["lease", "local", "source-host", "dest-host", "local", "release"]);
+  assert.equal(f.values.get(ledgerKey)[0].recovery.originalOutcome, "outcomeUnknown");
+});
+
+test("recovery never infers a missing durable target or accepts contradictory explicit identity", async () => {
+  let f = fixture();
+  const missing = await f.reconcile({ retryMethod: undefined, retryParams: undefined, requestKey: undefined });
+  assert.equal(missing.settled, false); assert.match(missing.reason, /retryMethod.*retryParams.*requestKey/); assert.deepEqual(f.order, []);
+  f = fixture({ withContext: true });
+  assert.equal((await f.reconcile({ requestKey: "f".repeat(64) })).status, "identityMismatch");
+  assert.equal((await f.reconcile({ retryParams: { ...params, destination: { ...params.destination, host: "other-host" } } })).status, "identityMismatch");
+  assert.deepEqual(f.order, []);
 });
 
 for (const [option, reason] of [["localBusy", /LOCAL_TRANSFER/], ["remoteBusy", /REMOTE_TRANSFER_SLOT_BUSY/],

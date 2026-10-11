@@ -926,6 +926,7 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
     let reader, writer;
     let sourceCode;
     let destinationCode;
+    let sourceSignal, destinationSignal;
     const sourceErrors = transferErrorLog(paths), destinationErrors = transferErrorLog(paths);
     const children = [], closed = new Set(), monitors = [];
     let starting = true, settled = false, failureError;
@@ -942,10 +943,14 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
       // including a reader whose peer failed synchronously during launch.
       if (starting || closed.size !== children.length) return;
       settled = true;
-      if (failureError) reject(failureError);
+      if (failureError) reject(failureError.code === "SSH_RELAY_FAILED" ? failure() : failureError);
       else { try { options.onWireBytes?.(wireBytes); resolve(); } catch (error) { reject(error); } }
     };
-    const failure = () => new Error(`内存转发失败（来源退出码 ${sourceCode} / 目标退出码 ${destinationCode}）：${[sourceErrors.text(), destinationErrors.text()].filter(Boolean).join("\n") || "SSH 不可用"}`);
+    const failure = () => Object.assign(new Error(`内存转发失败（来源退出码 ${sourceCode ?? "未取得"} / 目标退出码 ${destinationCode ?? "未取得"}）：${[sourceErrors.text(), destinationErrors.text()].filter(Boolean).join("\n") || "SSH 不可用"}`), {
+      code: "SSH_RELAY_FAILED", apiData: { phase: "stream",
+        source: { host: source.host, port: source.port, exitCode: sourceCode ?? null, signal: sourceSignal || null },
+        destination: { host: destination.host, port: destination.port, exitCode: destinationCode ?? null, signal: destinationSignal || null } },
+    });
     const launch = (target, command, isDestination) => {
       const child = spawnSsh(target, command, { windowsHide: true, stdio: ["pipe", isDestination ? "ignore" : "pipe", "pipe"] });
       children.push(child);
@@ -953,7 +958,8 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
       child.stdin.on("error", finish);
       child.on("close", (code, signal) => {
         closed.add(child);
-        if (isDestination) destinationCode = code; else sourceCode = code;
+        if (isDestination) { destinationCode = code; destinationSignal = signal; }
+        else { sourceCode = code; sourceSignal = signal; }
         finish(code === 0 && !signal ? undefined : failure());
       });
       child.stderr.on("data", chunk => (isDestination ? destinationErrors : sourceErrors).receive(chunk));
@@ -3811,12 +3817,16 @@ async function reconcileTransferOperationCore(params) {
     || [...activeTransfers.values()].some(transfer => transfer.operationId === operationId)
     || (row.operationInstanceId === currentTransferApiInstanceId() && !row.requestDone);
   if (hasLocalWork()) return receipt("outcomeUnknown", "旧传输本地请求/进程尚未退出");
-  const method = String(params.retryMethod || "");
+  const stored = row.recoveryContext;
+  const hasStoredIdentity = stored && typeof stored.method === "string" && stored.params && typeof stored.params === "object" && !Array.isArray(stored.params);
+  const method = String(params.retryMethod === undefined && hasStoredIdentity ? stored.method : params.retryMethod || "");
+  if (!method) return receipt("outcomeUnknown", "缺少原始恢复目标，请提供 retryMethod、retryParams 和 requestKey；未启动重传");
   if (method !== "sync.serverToServerFpsync" && method !== "upload.files" && !READ_ONLY_SETTLEMENT_METHODS.includes(method)) return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
   let identity, source, destination;
   try {
-    identity = retryIdentity(params.retryParams || {});
-    if (params.requestKey !== row.requestKey || ![clientRequestKey(method, identity), transferRequestKey(method, identity)].includes(row.requestKey))
+    identity = retryIdentity(params.retryParams === undefined && hasStoredIdentity ? stored.params : params.retryParams || {});
+    const requestKey = params.requestKey === undefined && hasStoredIdentity ? row.requestKey : params.requestKey;
+    if (requestKey !== row.requestKey || ![clientRequestKey(method, identity), transferRequestKey(method, identity)].includes(row.requestKey))
       return receipt("identityMismatch", "重试目标与旧传输身份不匹配");
     if (row.recoveryContext && JSON.stringify(row.recoveryContext) !== JSON.stringify({ method, params: identity }))
       return receipt("identityMismatch", "持久化传输目标不匹配");

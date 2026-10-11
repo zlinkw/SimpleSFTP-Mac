@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict"), Module = require("node:module");
 const { EventEmitter } = require("node:events");
-const { clientRequestKey } = require("../transfer-settlement");
+const { clientRequestKey, retryIdentity } = require("../transfer-settlement");
 const originalLoad = Module._load;
 let api;
 try {
@@ -18,7 +18,8 @@ function fixture(options = {}) {
   const retryMethod = "upload.files", retryParams = { localBase: "D:/fixture/project", server };
   const requestKey = clientRequestKey(retryMethod, retryParams), order = [];
   const values = new Map([[ledgerKey, [{ operationId: "old-upload", operationInstanceId: "123:old", status: "outcomeUnknown",
-    startedAt: new Date().toISOString(), remoteMutation: true, requestKey }]]]);
+    startedAt: new Date().toISOString(), remoteMutation: true, requestKey,
+    ...(options.withContext ? { recoveryContext: { method: retryMethod, params: retryIdentity(retryParams) } } : {}) }]]]);
   api.setTransferSettlementTestContext({ instanceId: "456:new", globalState: {
     get: (key, fallback) => values.get(key) || fallback,
     async update(key, rows) { if (options.persistence) throw Error("disk locked"); values.set(key, structuredClone(rows)); },
@@ -50,6 +51,15 @@ test("legacy upload.files resolves only after two local proofs, target writer ce
   await api.beginTransferOperation("retry", "456:new", true, f.requestKey);
   await api.finishTransferOperation("retry");
 });
+test("upload recovery by ID uses persisted exact target and retains all writer exit guards", async () => {
+  const f = fixture({ withContext: true });
+  assert.equal((await f.reconcile({ retryMethod: undefined, retryParams: undefined, requestKey: undefined })).settled, true);
+  assert.deepEqual(f.order, ["lease", "held", "local", "remote", "local", "held", "release"]);
+  const busy = fixture({ withContext: true, localBusy: true });
+  assert.equal((await busy.reconcile({ retryMethod: undefined, retryParams: undefined, requestKey: undefined })).settled, false);
+  assert.ok(!busy.order.includes("remote"));
+});
+
 test("only a fresh confirmed upload checks its exact legacy blocker; previews and failed proofs never dispatch", async () => {
   let f = fixture();
   const invoke = params => api.createLocalApiMethods()["upload.files"]({ ...f.retryParams, _requestKey: f.requestKey, ...params });

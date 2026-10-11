@@ -203,6 +203,22 @@ test("failed read-only source cannot obscure a destination with authoritative su
   assert.equal(receipt.operations.length, 0); assert.equal(receipt.settledOperations[0].status, "settled");
 });
 
+test("source-first relay failure waits for both exits and reports complete endpoint diagnostics", async () => {
+  const h = harness({ auto: false, autoKill: false });
+  const pending = h.api.relayTarFilesCore(source, destination, ["results/file.csv"], 20000, { compression: "none" });
+  let done = false; pending.catch(() => { done = true; });
+  const rejected = assert.rejects(pending, error => {
+    assert.equal(error.code, "SSH_RELAY_FAILED"); assert.equal(error.apiData.phase, "stream");
+    assert.equal(error.apiData.source.exitCode, 1); assert.equal(error.apiData.destination.exitCode, 255);
+    assert.equal(error.apiData.source.host, source.host); assert.equal(error.apiData.destination.host, destination.host);
+    assert.doesNotMatch(error.message, /undefined/); assert.match(error.message, /来源退出码 1.*目标退出码 255/);
+    return true;
+  });
+  h.calls[0].child.stderr.write("source tar: input missing\n"); h.calls[0].child.close(1);
+  await tick(); assert.equal(done, false); assert.equal(h.calls[1].child.killed, true);
+  h.calls[1].child.stderr.write("target ssh closed\n"); h.calls[1].child.close(255); await rejected;
+});
+
 test("invalid chunk checkpoint and missing confirmations launch no file stream", async () => {
   const h = harness({ control: () => JSON.stringify({ offset: 1, chunkBytes: 8 * 1024 * 1024 }) });
   await assert.rejects(h.api.transferChunkedServerFile(source, destination, "weights/model.bin", 20000, {
