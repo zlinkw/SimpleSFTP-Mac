@@ -6738,8 +6738,16 @@ async function withTransferCapacity(options, work) {
 }
 
 module.exports = {
-  waitForUpdateIdle: async () => {
-    while (activeTransfers.size || activeTransferResources.size || activeUploadOperations.size || uploadQueues.size) await new Promise(resolve => setTimeout(resolve, 250));
+  waitForUpdateIdle: async ({ signal } = {}) => {
+    while (activeTransfers.size || activeTransferResources.size || activeUploadOperations.size || uploadQueues.size) {
+      signal?.throwIfAborted();
+      await new Promise((resolve, reject) => {
+        const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(signal?.reason); };
+        const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, 250);
+        signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    signal?.throwIfAborted();
   },
   activate,
   deactivate,

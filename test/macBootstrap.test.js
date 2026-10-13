@@ -30,3 +30,22 @@ test("update idle waits for controller disposal AND child process close proof", 
     child.emit("close", 0); await idle; assert.equal(done, true);
   } finally { controller.dispose(); child.emit("close", 0); }
 });
+
+test("cancelling update idle leaves the original transfer and child resource running", async () => {
+  const Module = require("node:module"), { EventEmitter } = require("node:events");
+  const original = Module._load;
+  Module._load = function(name, ...args) { return name === "vscode" ? { TreeItem: class {} } : original.call(this, name, ...args); };
+  let extension; try { extension = require("../extension"); } finally { Module._load = original; }
+  const transfer = extension.__test.createTransferController({ id: "cancel-update-idle", operation: "upload", localPath: "/fixture", remotePath: "/fixture", host: "example" });
+  const child = new EventEmitter(); extension.__test.trackTransferResource(child, transfer.operationId);
+  let cancelled = false; transfer.onCancel(() => { cancelled = true; });
+  const controller = new AbortController();
+  try {
+    const waiting = extension.waitForUpdateIdle({ signal: controller.signal });
+    controller.abort(Error("cancel only update wait")); await assert.rejects(waiting, /cancel only update wait/);
+    assert.equal(cancelled, false); assert.equal(transfer.status, "running");
+    let idle = false; const remaining = extension.waitForUpdateIdle().then(() => { idle = true; });
+    transfer.dispose(); await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(idle, false);
+    child.emit("close", 0); await remaining; assert.equal(idle, true);
+  } finally { transfer.dispose(); child.emit("close", 0); }
+});

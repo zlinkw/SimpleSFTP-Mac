@@ -28,4 +28,4 @@ async function activate(context) {
   catch (error) { await vscode.window.showErrorMessage(`SimpleSFTP Mac 业务启动失败，更新入口仍可用：${error.message}`); }
 }
 async function deactivate() { await business?.deactivate?.(); }
-module.exports = { activate, deactivate, setUpdateGate: gate.setUpdateGate, waitForUpdateIdle: async () => { await business?.waitForUpdateIdle?.(); } };
+module.exports = { activate, deactivate, setUpdateGate: gate.setUpdateGate, waitForUpdateIdle: async options => { await business?.waitForUpdateIdle?.(options); } };
