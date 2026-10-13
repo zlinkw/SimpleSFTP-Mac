@@ -196,6 +196,49 @@ def tracked_dirty(root, rel):
         deny("DIRTY_TRACKED_TARGET")
 
 
+def formal_cleanup_owner(root, target, owner):
+    """Bind a direct formal directory or its exact declared CSV to registered execution identity."""
+    required = ("workflowId", "commandId", "globalJobId", "planRevision", "codeFingerprint", "index", "case", "seed", "outputDir", "collectionResultCsv")
+    if any(key not in owner or owner[key] is None for key in required):
+        deny("FORMAL_JOB_OWNER_REQUIRED")
+    if any(type(owner[key]) is not int for key in ("index", "seed")) or owner["index"] < 0:
+        deny("FORMAL_JOB_OWNER_INVALID")
+    if owner["globalJobId"] != str(owner["workflowId"]) + ":" + str(owner["index"]):
+        deny("FORMAL_JOB_OWNER_INVALID")
+    if any(not isinstance(owner[key], str) or not owner[key] for key in ("workflowId", "commandId", "case")):
+        deny("FORMAL_JOB_OWNER_INVALID")
+    if any(not re.fullmatch(r"[a-f0-9]{64}", str(owner[key])) for key in ("planRevision", "codeFingerprint")):
+        deny("FORMAL_JOB_OWNER_INVALID")
+    output, csv = relative(owner["outputDir"]), relative(owner["collectionResultCsv"])
+    if "attempts" in output.split("/") or not (target["type"] == "directory" and target["relativePath"] == output
+            or target["type"] == "file" and target["relativePath"] == csv):
+        deny("FORMAL_JOB_TARGET_MISMATCH")
+    manifest = path_guard(root, output + "/formal_job_owner.json")
+    info = os.lstat(manifest)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 65536:
+        deny("FORMAL_JOB_OWNER_INVALID")
+    with open(manifest, "rb") as stream:
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        deny("FORMAL_JOB_OWNER_INVALID")
+    try:
+        record = json.loads(raw.decode("utf-8-sig"))
+    except (ValueError, UnicodeError):
+        deny("FORMAL_JOB_OWNER_INVALID")
+    if (not isinstance(record, dict) or type(record.get("schemaVersion")) is not int or record["schemaVersion"] != 1
+            or any(type(record.get(key)) is not int for key in ("index", "seed"))
+            or any(record.get(key) != owner[key] for key in required)):
+        deny("FORMAL_JOB_OWNER_MISMATCH")
+    if record.get("state") not in ("failed", "completed", "training_completed") or owner.get("expectedState") and record.get("state") != owner["expectedState"]:
+        deny("FORMAL_JOB_OWNER_NOT_TERMINAL")
+    if not re.fullmatch(r"[a-f0-9]{64}", str(record.get("configHash", ""))):
+        deny("FORMAL_JOB_CONFIG_UNVERIFIED")
+    after = os.lstat(manifest)
+    if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        deny("CONTENT_CHANGED")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def inspect(root, target, archived=False):
     rel = relative(target["relativePath"])
     full = path_guard(root, rel, archived)
@@ -208,10 +251,18 @@ def inspect(root, target, archived=False):
     if target.get("expectedSha256") and (target["type"] != "file" or value["inventory"][0].get("sha256") != target["expectedSha256"]):
         deny("OWNERSHIP_HASH_MISMATCH")
     owner = target.get("expectedOwner")
+    formal = isinstance(owner, dict) and owner.get("resultPathPolicy") == "declared"
+    if formal:
+        owner_hash = formal_cleanup_owner(root, target, owner)
+        value["formalOwnerSha256"] = owner_hash
+        value["fingerprint"] = digest({"target": value["fingerprint"], "formalOwnerSha256": owner_hash})
     references = []
     if owner and target["type"] == "directory":
         aliases = {"workflowId": ("workflowId", "workflow_id", "planWorkflowId"), "commandId": ("commandId", "command_id"),
                    "workerId": ("workerId", "worker_id"), "attempt": ("attempt",), "case": ("case", "case_name"), "seed": ("seed",)}
+        if formal:
+            aliases.pop("attempt")
+            aliases.update({key: (key,) for key in ("globalJobId", "planRevision", "codeFingerprint", "index")})
         for name in ("artifact_manifest.json", "run_wrapper_report.json", "checkpoint_manifest.json"):
             manifest = os.path.join(full, name)
             if not os.path.isfile(manifest):
@@ -374,6 +425,9 @@ def mutation_lock(root):
 
 def main(request):
     root, identity = root_guard(request["root"])
+    expected_owner = request.get("target", {}).get("expectedOwner")
+    if expected_owner is not None and not isinstance(expected_owner, dict):
+        deny("OWNERSHIP_UNVERIFIED")
     action = request["action"]
     if action not in ("check", "verify", "inventory", "inspect", "move", "delete", "restore", "settle"):
         deny("UNKNOWN_ACTION")
@@ -384,7 +438,12 @@ def main(request):
             deny("UNSAFE_PARENT")
         if not os.path.lexists(full):
             return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
-        return {"ok": True, "rootIdentity": identity, "target": {**contents(root, full, target["type"]), "absolutePath": full}}
+        value = contents(root, full, target["type"])
+        if (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared":
+            owner_hash = formal_cleanup_owner(root, target, target["expectedOwner"])
+            value["formalOwnerSha256"] = owner_hash
+            value["fingerprint"] = digest({"target": value["fingerprint"], "formalOwnerSha256": owner_hash})
+        return {"ok": True, "rootIdentity": identity, "target": {**value, "absolutePath": full}}
     if action in ("check", "settle", "verify"):
         if request.get("rootIdentity") and request["rootIdentity"] != identity:
             deny("ROOT_IDENTITY_CHANGED")
@@ -393,7 +452,7 @@ def main(request):
         destination = path_guard(root, target["destination"], True, True)
         if os.path.lexists(source):
             if action == "check":
-                value = contents(root, source, target["type"])
+                value = inspect(root, target) if (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared" else contents(root, source, target["type"])
                 if value["fingerprint"] != target["fingerprint"]:
                     deny("SOURCE_RECREATED_OR_CHANGED")
                 if os.path.lexists(destination):
@@ -427,9 +486,13 @@ def main(request):
         return {"ok": True, "rootIdentity": identity, "target": value}
     if identity != request["rootIdentity"] or value["fingerprint"] != target["fingerprint"]:
         deny("PREVIEW_CHANGED")
-    if action in ("move", "delete") and target["destination"] != "clean_dir/" + target["relativePath"]:
+    batch = target.get("archiveBatch")
+    if batch is not None and (not isinstance(batch, str) or not re.fullmatch(r"job-[a-f0-9]{48}", batch)):
+        deny("UNSAFE_ARCHIVE_BATCH")
+    archive_prefix = "clean_dir/" + (batch + "/" if batch else "")
+    if action in ("move", "delete") and target["destination"] != archive_prefix + target["relativePath"]:
         deny("UNSAFE_DESTINATION")
-    if action == "restore" and target["destination"] != target["relativePath"][10:]:
+    if action == "restore" and (not target["relativePath"].startswith(archive_prefix) or target["destination"] != target["relativePath"][len(archive_prefix):]):
         deny("UNSAFE_DESTINATION")
     record = {"operationId": request["operationId"], "action": action, "source": value["absolutePath"], "destination": value["destination"], "type": target["type"], "fingerprint": value["fingerprint"], "contentFingerprint": value["contentFingerprint"], "inventory": value["inventory"], "time": time.time()}
     audit(root, {**record, "phase": "intent"})

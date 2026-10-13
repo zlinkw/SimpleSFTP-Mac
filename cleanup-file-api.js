@@ -35,15 +35,17 @@ class CleanupFileApi {
     const rows = []; let identity;
     for (const target of targets) {
       if (!target || !["file", "directory"].includes(target.type)) fail("UNCERTAIN_TYPE");
-      if (action === "restore" ? !target.relativePath?.startsWith("clean_dir/") || target.destination !== target.relativePath.slice(10)
-        : target.destination !== "clean_dir/" + target.relativePath) fail("UNSAFE_DESTINATION");
+      if (target.archiveBatch !== undefined && !/^job-[a-f0-9]{48}$/.test(target.archiveBatch)) fail("UNSAFE_ARCHIVE_BATCH");
+      const archivePrefix = "clean_dir/" + (target.archiveBatch ? target.archiveBatch + "/" : "");
+      if (action === "restore" ? !target.relativePath?.startsWith(archivePrefix) || target.destination !== target.relativePath.slice(archivePrefix.length)
+        : target.destination !== archivePrefix + target.relativePath) fail("UNSAFE_DESTINATION");
       const result = await this.checked({ node, root: node.root, action: "inspect", archived: action === "restore", target });
       if (identity && hash(identity) !== hash(result.rootIdentity)) fail("ROOT_IDENTITY_CHANGED");
       identity = result.rootIdentity;
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
-      action, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
