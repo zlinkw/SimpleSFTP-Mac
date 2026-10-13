@@ -251,7 +251,7 @@ class ResourceOperationLeaseManager {
         }));
         return rows.filter((row) => row !== undefined);
     }
-    async legacyGuard() {
+    async legacyGuard(existingOperation = false) {
         try {
             const text = await fs.readFile(this.leasePath, "utf8");
             let row;
@@ -261,6 +261,10 @@ class ResourceOperationLeaseManager {
             catch {
                 row = {};
             }
+            // Paired updates block admission, not the transfers already draining.
+            // Existing owners still pass all ordinary ownership/heartbeat gates.
+            if (existingOperation && row.actionType === "mac-preview-update")
+                return;
             const expiry = Date.parse(row.expiresAt) || (await fs.stat(this.leasePath)).mtimeMs + 30_000;
             if (expiry > this.now())
                 throw new Error(`旧版全局锁仍由窗口 ${row.windowId || "未知"} 持有。请重新加载该窗口以完成两款插件升级，然后重试；不能绕过活动旧锁。`);
@@ -390,7 +394,7 @@ class ResourceOperationLeaseManager {
             } };
     }
     async assertOwned(record) {
-        await this.legacyGuard();
+        await this.legacyGuard(true);
         const own = JSON.parse(await fs.readFile(this.file, "utf8"));
         if (own.windowId !== this.windowId || !own.leases.some((row) => row.leaseId === record.leaseId && Date.parse(row.expiresAt) > this.now())) {
             throw this.options.lostError?.() || new Error("资源锁持有证明已失效，停止提交修改；请重新加载窗口后重试。");
