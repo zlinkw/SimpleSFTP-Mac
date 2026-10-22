@@ -6,17 +6,20 @@ class ProgressInactivity {
     idleMs;
     onIdle;
     now;
+    notifyOnly;
     timer;
     phases = new Set();
     phase = "";
     counts = new Map();
     pausedAt;
     ended = false;
+    notified = false;
     lastProgressAt;
-    constructor(idleMs, onIdle, now = Date.now) {
+    constructor(idleMs, onIdle, now = Date.now, notifyOnly = false) {
         this.idleMs = idleMs;
         this.onIdle = onIdle;
         this.now = now;
+        this.notifyOnly = notifyOnly;
         this.lastProgressAt = now();
         this.arm();
     }
@@ -36,6 +39,7 @@ class ProgressInactivity {
         if (phase)
             this.phases.add(key);
         if (changed) {
+            this.notified = false;
             this.lastProgressAt = this.now();
             this.arm();
         }
@@ -56,16 +60,21 @@ class ProgressInactivity {
         this.arm();
     }
     check() {
-        if (this.ended || this.pausedAt !== undefined || this.now() - this.lastProgressAt < this.idleMs)
+        if (this.ended || this.notified || this.pausedAt !== undefined || this.now() - this.lastProgressAt < this.idleMs)
             return false;
-        this.dispose();
+        if (this.notifyOnly) {
+            clearTimeout(this.timer);
+            this.notified = true;
+        }
+        else
+            this.dispose();
         this.onIdle();
         return true;
     }
     dispose() { this.ended = true; clearTimeout(this.timer); }
     arm() {
         clearTimeout(this.timer);
-        if (this.ended || this.pausedAt !== undefined)
+        if (this.ended || this.notified || this.pausedAt !== undefined)
             return;
         this.timer = setTimeout(() => { if (!this.check())
             this.arm(); }, Math.max(1, this.idleMs - (this.now() - this.lastProgressAt)));

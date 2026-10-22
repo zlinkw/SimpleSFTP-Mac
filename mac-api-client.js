@@ -121,7 +121,7 @@ function requestLocalJson(discovery, route, body, maxBytes = 16 * 1024 * 1024, t
                 }
             });
         });
-        const timer = setTimeout(() => { reject(new Error("Local API request timed out")); req.destroy(); }, timeoutMs);
+        const timer = timeoutMs > 0 ? setTimeout(() => { reject(new Error("Local API request timed out")); req.destroy(); }, timeoutMs) : undefined;
         req.on("close", () => clearTimeout(timer));
         req.on("error", reject);
         req.end(body);
@@ -146,7 +146,10 @@ async function callLocalRpc(readDiscovery, method, params) {
         if (fresh[key] !== discovery[key])
             throw new Error("Local API discovery changed during preflight; check the current listener before retrying");
     }
-    const result = await requestLocalJson(fresh, "/api/v1/rpc", body);
+    // Same file-operation timeout policy as the frozen Windows CLI.
+    const fileOperation = /^(sync[.]|upload[.]|download[.]|remote[.]|files[.]cleanup[.])/.test(method)
+        || ["project.create", "handoff.markReady", "downloadScope.configure"].includes(method);
+    const result = await requestLocalJson(fresh, "/api/v1/rpc", body, 16 * 1024 * 1024, fileOperation ? 0 : 15000);
     if (result.jsonrpc !== "2.0" || result.id !== 1 || !(Object.hasOwn(result, "result") !== Object.hasOwn(result, "error"))
         || (Object.hasOwn(result, "error") && (!result.error || typeof result.error !== "object" || Array.isArray(result.error))))
         throw new Error("Invalid local API JSON-RPC response");

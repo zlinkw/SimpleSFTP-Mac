@@ -2,7 +2,7 @@
   "name": "simple-sftp-mac",
   "displayName": "SimpleSFTP Mac",
   "description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-  "version": "0.2.101",
+  "version": "0.2.102",
   "publisher": "simple-local",
   "extensionKind": [
     "ui"
@@ -32,20 +32,25 @@
     "resource-operation-lease.js",
     "state-store.js",
     "workspace-path.js",
+    "cleanup-file-api.js",
+    "cleanup-files.py",
+    "mac_cleanup_handles.py",
     "tar-writer.js",
     "bin/simple-sftp-api.js",
     "readme.md",
     "LICENSE.txt",
+    "agent-lifecycle.js",
+    "agent-lifecycle.py",
+    "transfer-file-progress.js",
     "mac-paths.js",
     "mac-cli.js",
     "mac-api-client.js",
     "mac-bootstrap.js",
     "mac-update-gate.js",
     "mac-auth.js",
+    "mac-tunnel-auth.js",
     "mac-ssh-askpass.js",
-    "mac-ssh-askpass.sh",
-    "cleanup-file-api.js",
-    "cleanup-files.py"
+    "mac-ssh-askpass.sh"
   ],
   "engines": {
     "vscode": "^1.80.0"
@@ -66,6 +71,7 @@
     "onCommand:simpleSftpMac.uploadFiles",
     "onCommand:simpleSftpMac.markHandoffReady",
     "onCommand:simpleSftpMac.configureDownloadScope",
+    "onCommand:simpleSftpMac.agentLifecycle",
     "onCommand:simpleSftpMac.configureAuthentication"
   ],
   "main": "./mac-bootstrap.js",
@@ -96,10 +102,6 @@
         "title": "SimpleSFTP：设置下载文件范围"
       },
       {
-        "command": "simpleSftpMac.showCliEntry",
-        "title": "SimpleSFTP Mac：查看 CLI 入口"
-      },
-      {
         "command": "simpleSftpMac.selectServer",
         "title": "SimpleSFTP：选择服务器"
       },
@@ -122,6 +124,10 @@
       {
         "command": "simpleSftpMac.configureAuthentication",
         "title": "SimpleSFTP Mac：配置服务器认证"
+      },
+      {
+        "command": "simpleSftpMac.showCliEntry",
+        "title": "SimpleSFTP Mac：查看 CLI 入口"
       }
     ],
     "views": {
@@ -139,23 +145,23 @@
           "type": "string",
           "default": "",
           "scope": "application",
-          "description": "Mac 首版使用本机 file 工作区，此项保持空值；Dev Containers 不在首版支持范围。"
+          "description": "可选 Windows 宿主工作区根目录。仅用于将 Dev Container 工作区映射到 UI Extension Host；普通 Windows 工作区无需配置。"
         },
         "simpleSftpMac.workspaceContainerRoot": {
           "type": "string",
           "default": "",
           "scope": "application",
-          "description": "Mac 首版不支持 Dev Containers，此项保持空值。"
+          "description": "可选 Dev Container 工作区根目录，例如 /workspaces。远程工作区上传下载必须同时配置宿主根。"
         },
         "simpleSftpMac.remoteBase": {
           "type": "string",
           "default": "",
-          "description": "用于选择项目的 Linux 远端项目父目录，填写用户实际配置的绝对 POSIX 路径。"
+          "description": "用于选择项目的远端根目录。"
         },
         "simpleSftpMac.localBase": {
           "type": "string",
           "default": "",
-          "description": "创建同步项目时使用的 Mac 本机父目录，例如 /Users/实际用户名/Projects；使用绝对路径，不填 ~ 或 $HOME。"
+          "description": "创建同步项目时使用的本地根目录。"
         },
         "simpleSftpMac.sshHost": {
           "type": "string",
@@ -211,7 +217,7 @@
           "default": 600,
           "minimum": 0,
           "maximum": 86400,
-          "description": "兼容旧配置；不再限制业务总时长。文件步骤连续 120 秒无真实进展才结束等待。"
+          "description": "兼容旧配置；不限制传输总时长。按实际文件字节和数量展示进度，暂无变化时提示等待，用户可取消。"
         },
         "simpleSftpMac.uploadCancellable": {
           "type": "boolean",

@@ -13,28 +13,36 @@ Module._load = function (request, ...args) {
     workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   } : originalLoad.call(this, request, ...args);
 };
+// Linux 门禁无 AppData 写权限：把租约根指到本测试进程的临时目录（仅改环境变量，不改生产代码）。
+process.env.APPDATA = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "simple-sftp-gate-lease-"));
 const { __test } = require("../extension.js");
 Module._load = originalLoad;
-test.afterEach(() => __test.setRemoteBatchTransport(null));
+const { createTransferHarness } = require("./_helpers/supportedHostPlatform");
 
 test("cross-Plan paths use one gzip archive and preserve verification", async () => {
   const files = Array.from({ length: 120 }, (_, index) => `work_dirs/${index % 2 ? "ebmc" : "cpsc"}/attempts/current/${index}.log`);
   let copies = 0;
   // Force different destination hashes on the initial inspection only.
-  let inspections = 0;
-  const handler = async (target, command, requested) => {
-    if (/tar --null -T - -cvf -/.test(command)) {
+  let destinationInspections = 0;
+  // 隔离夹具：win32 批量命令通道作为沙箱内显式事实注入（非真实进程平台），
+  // 真实 macOS 内存转发分支由 macRelay 专项覆盖，真实 Windows 通道由 host_windows 在真机执行。
+  const { sandbox } = createTransferHarness({
+    platform: "win32",
+    batch: async (target, command, requested) => {
+      assert.match(command, /tar --null -T - -cvf -/);
       copies++; assert.match(command, /gzip -dc/); assert.match(command, /pigz -p 2 -6 -c/);
-      assert.deepEqual(requested, files.slice().sort()); return "";
-    }
-    inspections++;
-    return JSON.stringify({ files: Object.fromEntries(requested.map(file => [file,
-      target.host === "destination" && inspections <= 2 ? "b".repeat(64) : "a".repeat(64)])) });
-  };
-  __test.setRemoteBatchTransport(handler);
-  const result = await __test.syncServerToServerFpsyncCore({
-    source: { host: "source", user: "researcher", remotePath: "/project" },
-    destination: { host: "destination", user: "researcher", remotePath: "/project" },
+      // 夹具在隔离 vm realm 内构造数组，比较前规范化为宿主 realm 数组（仅去 realm 差异，不改断言语义）。
+      assert.deepEqual(Array.from(requested), files.slice().sort()); return "";
+    },
+    fpsync: { inspect: async (target, paths) => {
+      destinationInspections += target.host === "destination" ? 1 : 0;
+      const hash = target.host === "destination" && destinationInspections === 1 ? "b".repeat(64) : "a".repeat(64);
+      return { files: Object.fromEntries(paths.map(file => [file, hash])) };
+    } },
+  });
+  const result = await sandbox.syncServerToServerFpsyncCore({
+    source: { host: "source", port: 22, username: "researcher", remotePath: "/project" },
+    destination: { host: "destination", port: 22, username: "researcher", remotePath: "/project" },
     relativePaths: files, compression: "auto", singleStream: true, confirm: true, pathConfirmed: true,
   }, { report() {} });
   assert.equal(copies, 1); assert.equal(result.partitions, 1);

@@ -1,164 +1,56 @@
 # SimpleSFTP Mac
 
-SimpleSFTP Mac 是 Apple Silicon Mac 的 VS Code 文件传输扩展，与 [SimpleExperiment Mac](https://github.com/zlinkw/SimpleExperiment-Mac) 配套。沿用 SSH/tar 流式传输、路径确认和传输结算职责，扩展身份、设置、配置目录和更新源与 Windows 原版独立。
+Apple Silicon、macOS26+ 的 VS Code SSH/tar 传输扩展，配套 [SimpleExperiment Mac](https://github.com/zlinkw/SimpleExperiment-Mac)。Windows为业务唯一权威；Mac只适配本机路径、SSH/凭据、应用数据和CLI。
 
-**当前为 preview 测试版，完整 Mac 传输和认证尚未真机验收。** 已接入本地 POSIX 工作区、中文/空格路径、大小写及独立密钥、ssh-agent、密码和私钥口令；断连恢复与完整科研接入仍在适配。不要套用原 Windows 的使用说明。
+**2026-10-22 对齐源码尚未构建、测试或发布。** package 已统一递增为 0.2.102，满足 ≥0.2.102 共同更新租约协议的最低要求，但首次过渡尚未构建验证。冻结 Windows SFTP **0.2.104 / 13ef630a12c6ea02ad9277452e75dbf443b9a34b**，配套 Experiment **0.5.400 / 30626e78ea2f4b8a3e19e2cb09ae6aefcc6deb39**。本轮同步批量隔离/快速清理、控制器对象身份忙证据、进度/结算和等待策略；保留 Mac 原生认证、路径、CLI、更新租约及 Darwin 句柄证明。7 类运行验证未执行；Experiment 旧同步范围本机直接删除另有 1 项源码缺口，已显式阻断。见 [078 对齐说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-alignment-2026-10-22.md)。
 
-## 系统要求与首次安装
+## 安装和更新入口
 
-- Apple Silicon、macOS 26 及以上；配套使用 VS Code 1.100.0 及以上。
-- 本地 file 工作区；Dev Containers 和 Intel Mac 不在首版支持范围。
-- 远端 Linux 使用 SSH、tar 和受管 Python 辅助代码。
-
-两个 VSIX 都在 **[SimpleExperiment Mac Releases](https://github.com/zlinkw/SimpleExperiment-Mac/releases)**，公开下载无需 GitHub 登录。
-
-1. 在同一个 preview Release 下载两份 `darwin-arm64.vsix` 附件。
-2. 按 **⇧⌘P**，运行 **Extensions: Install from VSIX…**，先安装 `simple-sftp-mac-<版本>-darwin-arm64.vsix`。
-3. 再安装 `simple-experiment-mac-<版本>-darwin-arm64.vsix`。
-4. 运行 **Developer: Reload Window**，确认扩展身份 `simple-local.simple-sftp-mac` 与 `simple-local.simple-experiment-mac`。
-
-无需运行原 Windows 的 install:latest 脚本。
-
-## 更新按钮入口
-
-SimpleSFTP Mac 0.2.101起保留正在传输操作的续租/验主，配套更新只关闭新操作入口。更新进度的取消会停止等待，原传输及子进程继续；首次过渡先等待本地传输完成再安装配套版本。正式失败job的审核新增终态owner/SHA和冻结归档batch验证，仍保留Mac句柄证明不足的执行阻断，详见[新增功能说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-sync-2026-10-13.md)。
-
-本轮配套同步Windows分叉后的受限PLAN清理接口：由SimpleExperiment Mac的Plan区“清除 PLAN 及关联产物”进入，只读预览精确目标、身份与未完成节点，再按页面确认。独立认证、共享租约和传输退出证明继续保留。macOS尚缺可靠打开文件句柄证明，实际清理返回`HANDLE_CHECK_UNAVAILABLE`并阻断，不可通过其他入口绕过；永久删除仍需两次完整路径确认。参考提交与边界见[功能同步说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-sync-2026-10-12.md)。
+两份darwin-arm64 VSIX和release.json统一在 [SimpleExperiment Mac Releases](https://github.com/zlinkw/SimpleExperiment-Mac/releases)，公开下载不要求登录。首次 **⇧⌘P → Extensions: Install from VSIX…** 按 **SimpleSFTP Mac → SimpleExperiment Mac** 安装，再 **Developer: Reload Window**。本轮没有新包。
 
 | 入口 | 操作 |
 | --- | --- |
-| **底部右侧状态栏** | 点击 **Mac preview：…**，检查配套更新。 |
-| **SimpleSFTP 命令面板 ⇧⌘P** | 运行 **SimpleSFTP Mac：检查 preview 配套更新**。 |
-| **SimpleExperiment 命令面板** | 运行 **SimpleExperiment Mac：检查 preview 配套更新**。 |
-| **SimpleExperiment 面板 → 设置** | 在 **插件配套更新** 中点击 **检查更新**。 |
+| 命令面板 | **SimpleSFTP Mac：检查 preview 配套更新** 转到 SimpleExperiment Mac。 |
+| 底部右侧状态栏 | 点击 **配套更新：…**。 |
+| Experiment面板 → 设置 | **插件配套更新 → 检查更新 → 安装并重载**。 |
+| 安装/补装 | **SimpleExperiment：安装或补装配套更新并重载**；旧Mac preview安装命令保留为别名。 |
 
-SimpleSFTP 的检查入口会激活 SimpleExperiment Mac 并检查两个插件，配套插件未安装时提示首次安装步骤。独立更新入口不需要服务器、Termius 或业务面板成功加载。
+共同更新流程保留检查与安装分离、每30分钟检查、同版跳过、禁止降级、全部下载校验、SFTP先装以及部分失败补装。已开始的本地传输继续，新业务在更新期间被阻止；取消等待不终止远端任务。旧mac-preview-update及新paired-plugin-update租约均被识别，实际事务只用共同实现。旧版过渡仍待验证。
 
-发现更新后点击通知中的 **更新并重载**。同一版本只主动提醒一次；关闭通知后，运行 **SimpleExperiment Mac：安装 preview 配套更新**。启动检查一次，此后每 30 分钟检查，只使用 preview 通道。
+## 配置与认证
 
-安装前等待已有本地传输和子进程退出，阻止新业务操作；先下载并校验全部待更新包，再按 **SimpleSFTP Mac → SimpleExperiment Mac** 安装并重载。不会停止远端实验，相同版本跳过，不自动降级。
+1. **File → Open Folder…** 打开本机项目，一个窗口一个项目。
+2. **⌘,** 搜索simpleSftpMac，填写真实localBase和remoteBase项目父目录；首次可关闭uploadOnSave，先 **查看当前目标**。
+3. **SimpleSFTP：打开共享服务器配置** 填真实主机、用户、SSH端口和远端目录，再 **选择服务器**。已有服务器资产不从Windows扩展自动导入，不自动迁移真实目录。
+4. **SimpleSFTP Mac：配置服务器认证** 选择该目标的认证方式。Termius密码不由插件读取。
 
-源不可达或限流显示 **检查失败**，网络恢复后手动重试。部分安装失败显示已完成与待完成组件，选择 **重载后补装** 后只安装剩余组件。
-
-## 文件传输使用说明
-
-### Mac 上先配置目标
-
-1. VS Code 菜单 **File → Open Folder…** 打开本机项目；一个窗口只打开一个项目。
-2. 按 **⌘,** 搜索 `simpleSftpMac`。`localBase` 填本机项目父目录，例如 `/Users/实际用户名/Projects`；`remoteBase` 填真实 Linux 项目父目录。初次接入可将 `uploadOnSave` 关闭，先检查目标再手动上传。`workspaceHostRoot` 与 `workspaceContainerRoot` 留空。
-3. 按 **⇧⌘P → SimpleSFTP：打开共享服务器配置**。下面示例中的主机、用户名、端口和路径均需替换；多个服务器各有唯一 `id`：
-
-```json
-{
-  "version": 1,
-  "activeServerId": "worker-a",
-  "servers": [
-    {
-      "id": "worker-a",
-      "label": "Worker A",
-      "host": "你自己的 SSH 主机名或别名",
-      "user": "远端实际用户名",
-      "sshPort": 22,
-      "remotePath": "/data/你的实验父目录",
-      "localBase": "/Users/实际用户名/Projects",
-      "enabled": true
-    }
-  ]
-}
-```
-
-4. 保存后运行 **SimpleSFTP：选择服务器**，然后 **SimpleSFTP：查看当前目标**，核对账号、SSH 端口及完整路径。`sshPort` 填服务器 SSH 端口，不能填 Agent HTTP 转发端口。
-5. 已有本机 `~/.ssh/config` 时，可运行 **SimpleSFTP：导入 VS Code SSH 配置** 导入主机描述；不会读取 Termius 私有会话。随后运行 **SimpleSFTP Mac：配置服务器认证**，为每个真实 SSH 目标选择认证方式。选择或导入配置不表示连接测试通过。
-
-设置中的路径使用绝对 POSIX 路径，不填盘符、`~`、`$HOME` 或未替换的用户名。保留中文、空格与大小写，终端中的路径有空格时加引号。完整的本机配置、Termius 手动转发及三拓扑接入约定见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md)，配套面板顶部 **配置说明** 也可打开。
-
-本机/远端根目录保留 Unicode 拼写和目录名首尾空格，不解码字面 `%20`。重复 `/` 合并，末尾分隔符去掉；包含 `.`、`..`、反斜杠、控制字符或 Windows 路径会拒绝。`/Data/项目` 与 `/data/项目` 是不同远端目标，确认预览、上传和保存队列保持大小写。只读浏览允许 `/`，创建项目与上传必须使用具体目录。若请求与服务器对象的完整路径不一致，插件报“远端目标冲突”；核对真实目录后修改配置，不删去目录名中的真实空格来绕过检查。
-
-上传清单、Worker 相对文件路径和映射下载也保留中文、大小写、Unicode 拼写及首尾空格。相对路径以项目目录为根，不填绝对路径；拒绝 `..`/`.` 路径段、内部连续 `/`、反斜杠、冒号、控制字符和超过 4096 UTF-8 字节的名称。全部上传条目通过校验后才建立 SSH/tar。远端 `Model/a.json` 与 `model/a.json` 是两项，可分别映射到 `upper.json`、`lower.json`；本机映射仍拒绝只差大小写的目标名以防别名覆盖。tar 解包不删去文件名真实空格，也不将错误条目转换成另一目标。
-
-以上绝对路径、目录浏览、上传清单及映射下载通过本地模拟和真实本地 tar/Python 协议验证；CLI 及完整科研传输继续分批适配，尚无 M5/真实 SSH 验收证据。
-
-### 上传、下载与认证边界
-
-业务适配完成后的操作流程：打开本地项目 → 选择服务器与用户配置的远端目录 → 核对本机路径、账号、端口及完整目标路径 → 上传或下载。SimpleExperiment Mac 负责调度，SimpleSFTP Mac 负责真实传输。
-
-保留命令：**创建或打开远端项目**、**选择服务器**、**查看当前目标**、**上传工作区到目标**、**上传指定文件到目标**、**远端同步到本地**、**设置下载文件范围**、**上传并标记交接**。设置命名空间为 `simpleSftpMac.*`。
-
-在 Mac 按 **⇧⌘P → SimpleSFTP：设置下载文件范围**，核对本机/远端目标后选择 **添加远端文件夹** 或 **添加远端文件**；文件选择保留中文、大小写及真实首尾空格。范围浏览只允许当前远端项目内的路径，手动输入必须是该项目内的完整绝对 POSIX 路径。保存后可 **查看已选远端路径**，再运行 **远端同步到本地**；文件类型和大小上限按保存的规则过滤，选中的符号链接会拒绝下载。
-
-空字符串和非法路径会拒绝保存，不隐式变成整个项目。手动选择 **使用当前目录** 可明确选中项目根目录，预览显示 `.`；未设置任何范围时，原有整项目同步入口继续保留。API `sync.downloadPaths` 则必须提供具体相对文件或目录，拒绝 `.`、`./` 等整个项目别名。移除下载范围只修改配置，不删除文件。下载范围 UI/API、文件名/大小列表和本地 Python 归档通过本地模拟与协议验证，真实 SSH/M5 尚待验收。
-
-### 独立认证入口
-
-按 **⇧⌘P → SimpleSFTP Mac：配置服务器认证**，或在资源管理器 **SimpleSFTP → 配置服务器认证** 中选择已填写的服务器：
-
-| 方式 | 操作 |
+| 方式 | Mac适配 |
 | --- | --- |
-| 系统 SSH 配置 / 自动 | 沿用本机 OpenSSH 配置及默认密钥；私钥口令由插件密码输入框获取 |
-| 选择私钥 | 在 Mac 文件选择框选择真实私钥文件；保留中文和空格路径。加密私钥在首次连接时提示输入口令 |
-| ssh-agent | 使用当前 VS Code 进程可见的 `SSH_AUTH_SOCK` 中已加载身份，不转发 agent 到服务器 |
-| 密码 | 首次连接时在 VS Code 密码输入框填写该服务器密码，不要求服务器间免密登录 |
+| 系统SSH配置 / 自动 | 使用本机OpenSSH配置和默认密钥；需要SSH别名/跳板时选此模式。 |
+| 私钥 | 选择实际私钥文件；首次连接按需输入私钥口令。 |
+| ssh-agent | 使用VS Code进程可见的SSH_AUTH_SOCK，不要求服务器间免密。 |
+| 密码 | 在VS Code密码输入框输入对应服务器密码。 |
 
-独立密钥、agent 和密码模式直接使用服务器实际地址、用户和端口；不要将只能靠 `~/.ssh/config` 解析的别名当作真实主机。需要沿用自己的 SSH 别名/跳板配置时选择自动模式。
+默认仅本次会话记忆。明确勾选 **使用 VS Code SecretStorage 保存密码 / 私钥口令** 后才持久保存；密码不写服务器JSON、命令参数或临时文件。每个SSH地址/用户/端口分别认证。Agent生命周期和新增远端进度查询也使用同一认证适配器。
 
-认证按实际 SSH 地址、用户名和端口区分，两端分别配置。记忆选项默认不勾选，只在本次扩展会话内记忆；勾选 **使用 VS Code SecretStorage 保存密码 / 私钥口令** 后，输入的凭据才会保存以供重载后使用。选择不勾选时，不读取以前保存的凭据。重新运行配置命令可切换方式和记忆选项。
+## 传输、进度与清理
 
-密码和口令不写入 `servers.json`、项目设置、命令参数或临时文件；SSH 的 tar 标准输入仍只传文件数据。[VS Code SecretStorage](https://code.visualstudio.com/api/references/vscode-api#SecretStorage) 负责已选择保存的凭据。Termius 登录不会自动授权 SimpleSFTP，插件不读取其密码。真实密钥/密码上传下载、连接恢复仍待 M5 验收。
+保留Windows共同的命令、API、同步范围、错误分类和结算流程：**创建或打开远端项目、选择服务器、查看当前目标、上传工作区到目标、上传指定文件到目标、远端同步到本地、设置下载文件范围**。本机POSIX路径保留实际中文、空格和大小写；远端路径、类型、链接和范围按共同规则校验。
 
-Mac 跨服务器传输分别认证两端，默认经本机 SSH 流式中转，无需服务器之间免密互联。普通 tar 分组和大文件断点分块沿用哈希核对、接收检查点及有限并发；文件流通过本机内存管道传递，不生成本地中转压缩包。失败时等两个本地 SSH 进程退出；远端接收结果不明时须完成恢复核验才可补传，不盲目重试。两端地址、账号、端口及本地/远端路径必须来自用户配置。当前仅通过本地模拟与协议测试，真实跨服务器传输仍待 M5 验收。
+SSH/tar保持流式传输；跨服务器经本机流式中转，分别认证两端。进度和清理状态以本轮查询为准，失败结束本轮等待并提供重查；旧回执不造成永久忙状态。Agent更新接口直接复用Windows受管Agent与独立Scheduler生命周期，保留已运行/排队任务。
 
-上传前的路径确认保留。API 缺少确认返回 `CONFIRM_REQUIRED`。永久删除需要精确目标、直接父目录核验与两次确认，普通上传不镜像删除远端内容。
+SimpleExperiment的每job同步取最新产物与当前勾选范围交集。默认Worker间同步整个work_dirs，兼容work_dir；不恢复旧attempt/历史产物机制。
 
-### Mac 结果路径与来源
+删除继续要求精确目标、安全根、直接父目录、类型/链接防护和两次完整路径确认；失败不能当作完成。mac_cleanup_handles.py已为共同流程的原有句柄检查分支补入Darwin libproc只读适配，Experiment本机缓存执行器也复用该模块。扫描同用户的工作目录/线程目录、FD、fileport及映射，按冻结清单设备号/inode判断占用；占用返回ACTIVE_HANDLE，缺权限、ABI不符、枚举截断、身份变化或超时返回HANDLE_CHECK_UNAVAILABLE，不提权、不终止进程、不另建清理状态机。最新 path-only/fast batch/archive/顶层扫描路径均接入同一原生证明，目录冻结清单超过上限仍阻断。共同confirmed_paths/managed_tmux边界不变；这份源码尚未在Mac执行。本轮没有真实传输、部署或删除。
 
-在 SimpleExperiment Mac 的结果区选择完整 Plan，核对实际来源后手动同步。结果传输使用 SimpleSFTP 独立认证；任务完成不会自动下载。Plan、来源清单及本机映射保留中文、大小写、Unicode 拼写、真实首尾空格和字面 `%20`，不同目录同名文件分别处理。
+## 数据和CLI
 
-下载与缓存复用核对真实路径、大小和 SHA-256。出现来源冲突、无效 UTF8 或“本机映射路径拼写与已有磁盘条目不一致”时，查看实际目录/文件名并重新确认目标；不要删空格、改大小写或强制覆盖借用别的文件。更新不会自动升级服务器 Agent，需在 SimpleExperiment Mac 的 **准备项目与 Agent**主动确认上传，再在 Termius 手动处理并 **检测全部**，保留正在运行的实验。
-
-归档证据由 SimpleExperiment Mac 读取：旧条目只有明确属于同一原始 Plan、所请求 revision 且产物键匹配时才进入最终统计，身份不足的结果保留在预览。项目表还会从受检原始 CSV 和当前归档重计算校验；预览种子表保留完整记录，最终表仅使用当前归档记录。项目聚合不符时，在结果区选择报错的完整 Plan 重新解析后再同步。完整归档执行、项目聚合发布和 M5 尚未验收。解析按钮、YAML 路径示例与处理步骤见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md#mac-结果路径与来源)。
-
-论文证据由 SimpleExperiment Mac 的结果区 **检查论文证据**核验；声明保存在 UTF8 的 `paper/claims.md`。含空格的路径用反引号保留原名；Markdown URI 解码一次，字面 `%20` 在链接中编码为 `%2520`。先核对当前 Plan/revision 与归档，再手动同步所需来源；`supported` 表示证据关联，科研结论仍需实验与复核。操作与失败处理见上面的 Mac 配置说明。
-
-## 数据目录与 API
-
-| 内容 | Mac 位置 |
+| 内容 | 位置 |
 | --- | --- |
-| 服务器配置 | `~/Library/Application Support/SimpleSFTPMac/server-profiles/servers.json` |
-| API 发现文件 | `~/Library/Application Support/SimpleSFTPMac/api.json` |
-| 共享租约 | `~/Library/Application Support/SimpleLocalMac/SimpleExperiment/` |
+| 服务器资产 | ~/Library/Application Support/SimpleSFTPMac/server-profiles/servers.json |
+| API发现文件 | ~/Library/Application Support/SimpleSFTPMac/api.json |
+| 共同租约 | ~/Library/Application Support/SimpleLocalMac/SimpleExperiment/ |
 
-API 方法沿用原契约。地址、token、pid、版本来自当前发现文件，请求需要 Bearer token；每次调用前读取 `/api/v1/capabilities` 或 `/api/v1/openapi.json`，禁止猜端口和参数。
+**SimpleSFTP Mac：查看 CLI 入口** 提供simple-sftp-mac-api实际路径，终端需Node.js20+。自定义发现文件使用SIMPLE_SFTP_MAC_API_FILE；每次业务调用先读取当前发现文件和capabilities/openapi，不猜端口、不补确认、不自动重发未知请求。
 
-CLI 为 `simple-sftp-mac-api`，保留原 npm 入口。VSIX 在受支持 Mac 激活时生成固定入口，更新并重载后刷新到当前包；终端需要 **Node.js 20 或以上**。按 **⇧⌘P → SimpleSFTP Mac：查看 CLI 入口**，点击 **复制自检命令** 后执行，或直接运行：
-
-```sh
-"$HOME/Library/Application Support/SimpleSFTPMac/cli/simple-sftp-mac-api" self-check
-```
-
-自检只核对 CLI、发现文件和本机 API 监听，不连接 SSH 或验证远端任务。入口保留当前工作目录及中文/空格/引号参数，不自动修改 PATH；用户可自行将此 `cli` 目录加入终端 PATH，更新后无需重设。旧实例不把入口降级，未知文件/链接拒绝覆盖。找不到 Node 时先配置终端 Node；缺少发现文件/监听时，打开 VS Code 并确认 SFTP Mac 已激活。自定义发现文件环境变量为 `SIMPLE_SFTP_MAC_API_FILE`。固定入口与自检通过真实本地 shell/Node/API 模拟测试，业务命令与 M5 继续分批验收。
-
-CLI 业务 RPC 自动读取当前 Mac 发现文件和 `/api/v1/capabilities`，核对实时方法、身份与版本后发送原参数。未知方法、监听变化、非本机地址和错误 HTTP/JSON 响应会停止本次调用；不会自动重试传输或补上 `confirm`、`pathConfirmed`。出现预检失败时，打开对应 VS Code 扩展并重新自检，再核对实时契约主动调用。自行调用 HTTP API 时仍需自行发现与查询契约；此预检通过本地监听和真实 CLI 测试，真实传输/M5 尚待验收。
-
-科研 Plan 通过配套 `simpleex-mac experiment run` 申请标准路线，SimpleSFTP 保持传输职责。CLI 与 VS Code 的项目必须一致，在线路线检查通过后仍需 VS Code 人工确认；`requested: true`、`submitted: false`、`waiting_confirmation` 是等待确认回执，使用返回的 `operationId` 与实时 `operations.list` 查看后续状态。[Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md) 提供完整路径与预检示例；离线 `local_only` 不能作为科研就绪证明。
-
-配套 Mac 服务端在准备、校验及提交关键边界核对当前真实工作区；项目变化后重新预检，活动 Plan 不通过旧自动停止 fallback 中断。正式种子配置在保存的 Plan `seeds` 中，在线 Plan CLI 的 `--seed` 和 workflow API 的 `seed` 覆盖参数会拒绝；离线预览只返回 `seedApplied: false`。这些检查通过本地模拟，真实科研仍待验收。
-
-Plan 等待回执、人工重新运行及多 Worker 分布式同步/预演/排队也核对原项目；项目切换后请回到原项目确认操作和远端状态，不把另一项目的活动记录视为成功，不盲目重发。窗口切换不会自动停止远端已有实验。
-
-Mac Plan 选择请使用完整项目相对路径，例如 `experiments/plans/中文/A.yaml`。`A.yaml` 与 `a.yaml`、不同目录及文件名真实首尾空格分别保留；字面 `%20` 不转换为空格，Unicode 拼写不自动改写。面板选择、保存选择、提交身份和分布式重试不再合并这些不同路径。多个 Plan 使用同一显示名时必须选完整路径；错误完整路径不会退回另一个已选 Plan。终端参数加引号，查看实际文件名后重新选择，不靠改变大小写或删空格绕过失败。此批通过编译队列、真实生成面板与后台方法的本地模拟验证；结果/监控及完整科研仍继续适配，M5 未验收。
-
-Plan 目录默认为 `experiments/plans`，在 Mac 设置 `simpleExperimentMac.planDir` 中填写实际项目相对目录；保留中文和真实空格，不填绝对路径、反斜杠或 `..`。扫描与单文件摘要按实际目录条目区分大小写，YAML 文件名末尾真实空格也会保留。Plan 目录以下的符号链接和非普通文件会拒绝；读取期间文件、内容或工作区变化时，不使用该次结果，请核对文件后重新识别并预检。显式错误 Plan 不会自动改选唯一的另一个 Plan。摘要保留原读取预算和截断标记，完整本地配置检查读取全文。分布式路径合同、预演及入队使用真实相对路径，坏路径不会自动改成另一目录。以上通过编译模块与 POSIX 文件系统模拟验证；远端 Agent 输出路径、归档写入、结果/监控与 M5 验收仍继续分批。
-
-Agent 持久队列的 Plan/outputDir 身份、接收回执、旧队列派发及 recall/停止匹配也保留真实大小写、Unicode、字面 %20 和首尾空格；非法相对路径或非字符串不自动改写后接收。旧 queued 行的坏路径会等待处理，运行中记录不自动修改。该检查需服务器使用配套新版 Agent：更新扩展后，通过“准备项目与 Agent”核对并确认上传，在 Termius 手动启动后再检测；不要为升级中断已有实验。Agent 启动参数与 scheduler 的输出、attempt 子目录、工作目录、声明输入/输出及 Plan 状态 key 同样保留真实拼写。Plan 必须是项目内现有普通文件；已有路径条目按实际名称核对，符号链接、别名冲突和非法路径会在启动前拒绝。依赖检测后再次检查路径与原 Plan revision；原 Plan 读取全文，不受摘要预算限制。以上仅通过隔离编译函数和模拟 POSIX 文件系统验证；检查到实际启动/写入之间仍有变化窗口，结果/归档写入、真实科研与 M5 继续适配。出现路径身份冲突时核对原 Plan、完整回执和远端状态，不盲目重发。
-
-配套结果区选择完整 Plan，使用 **运行质量门禁 → 运行统计 → 导出论文表格**。当前原始 CSV/配置/归档重新核对；来源身份或行集合变化时先重新解析该 Plan，再手动同步需要的来源，不通过修改指标缓存或归档 JSON 绕过检查。完整写入原子性与 M5 仍待验收。
-
-结果契约、解析、摘要与旧归档证据的详细规则见 [Mac 配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md#mac-结果路径与来源)。本地编译/模拟 API/隔离 Agent 验证不代表真实传输、完整科研或 M5 验收。
-
-## 发布与验收
-
-两仓验证、提交并同步 origin/master 后，在 SimpleExperiment-Mac 执行 `npm run release:prepare`、`npm run release:publish`。release.json 绑定两仓提交，核验全部附件后发布，已发布版本不可覆盖。不使用 GitHub Actions，不自动安装开发机扩展。
-
-本地构建、测试和包闭包检查与 M5 真机验证分别记录。M5、24 GB、macOS 27.0 上的更新、Termius、认证上传下载、中文路径、断连恢复和三拓扑尚待验收，用户已安排延后验证。
-
-详情见 [Mac 发布与验收](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/mac-release-guide.md)，持续适配见 [目标模式计划](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/target-mode-plan.md)。
+本轮仅静态语法、依赖路径与源码指纹核对。类型/包闭包/构建/测试、M5凭据/中文路径/传输/断连、共同更新过渡及服务器生命周期均待验证；历史0.2.101测试结果不能套用到当前源码。详细使用流程见 [Mac配置说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/simple-experiment-setup.md)。

@@ -21,24 +21,42 @@ Module._load = function (request, ...args) {
     },
   } : originalLoad.call(this, request, ...args);
 };
+// Linux 门禁无 AppData 写权限：把租约根指到本测试进程的临时目录（仅改环境变量，不改生产代码）。
+process.env.APPDATA = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-gate-lease-"));
 const { __test } = require("../extension.js");
 Module._load = originalLoad;
+const { createTransferHarness } = require("./_helpers/supportedHostPlatform");
+// 隔离纯函数夹具：映射下载的真实生产链切片（条目规范化、双重确认、压缩协商、单批流接收、
+// tar 解包、SHA256 校验、取消、暂存/发布与阶段错误包装）在 vm 沙箱内执行；平台事实
+// （非 darwin 规范化分支）只作为沙箱内显式注入，绝不修改真实进程或生产模块。
+// 真实 Extension Host 平台门禁与 transfers.cancel 真实账本集成由本文件真实模块用例断言，
+// 并由父 host_windows 在真实 Windows 执行；darwin 分支由 Mac 专属套件覆盖。
+function mappedSuite() {
+  const harness = createTransferHarness({ platform: "win32", mapped: true });
+  return {
+    ...harness,
+    // 返回值经 structuredClone 规范化为宿主 realm 的 JSON 安全结果（仅去 realm 差异，不改断言语义）。
+    callMapped: (params) => Promise.resolve(harness.sandbox.downloadMappedPathsMethod(params)).then((result) => structuredClone(result)),
+    setTransport: (fn) => harness.sandbox.setMappedDownloadTransport(fn),
+  };
+}
 
 const BLOCK = 512;
 
 test("wrapper memory review accepts TSV JSONL YAML and binary results without disk output", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-wrapper-review-"));
   const bodies = [Buffer.from('label\tnote\n案例\t保留\n'), Buffer.from('{"value":null}\n'), Buffer.from('model: same\n'), Buffer.from([0, 255, 2, 9])];
   const entries = ['a.tsv', 'a.jsonl', 'a.yaml', 'mask.npz'].map((name, index) => ({ remotePath: 'work_dirs/case/attempts/run/' + name,
     localRelativePath: 'unused/' + name, bytes: bodies[index].length, sha256: require('crypto').createHash('sha256').update(bodies[index]).digest('hex') }));
-  __test.setMappedDownloadTransport(() => tarStream(bodies.map((body, index) => ({ name: 'mapped/' + index, body }))));
+  suite.setTransport(() => tarStream(bodies.map((body, index) => ({ name: 'mapped/' + index, body }))));
   try {
-    const result = await __test.createLocalApiMethods()['sync.downloadMappedPaths'](baseParams(root, entries,
+    const result = await suite.callMapped(baseParams(root, entries,
       { memoryOnly: true, metricsOnly: true, wrapperResults: true, compression: 'none' }));
     assert.equal(result.memoryOnly, true);
     assert.deepEqual(result.entries.map(entry => Buffer.from(entry.dataBase64, 'base64')), bodies);
     assert.deepEqual(fs.readdirSync(root), []);
-  } finally { __test.setMappedDownloadTransport(null); }
+  } finally { suite.setTransport(null); }
 });
 
 test("wrapper memory review still refuses weights code state missing hashes and oversized files", () => {
@@ -105,37 +123,40 @@ test("oversized mapped manifests are refused before allocating a controller or l
 });
 
 test("memory-only metrics return verified bytes without raw files or staging directories", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-"));
   const body = "case,seed,value\n样例,42,0.91\n";
   const sha256 = require("crypto").createHash("sha256").update(body).digest("hex");
-  __test.setMappedDownloadTransport(() => tarStream([{ name: "mapped/0", body }]));
+  suite.setTransport(() => tarStream([{ name: "mapped/0", body }]));
   try {
-    const result = await __test.createLocalApiMethods()["sync.downloadMappedPaths"](baseParams(root, [
+    const result = await suite.callMapped(baseParams(root, [
       { remotePath: "work_dirs/run-b/test_results/formal_result_rows.csv", localRelativePath: "unused/raw.csv", bytes: Buffer.byteLength(body), sha256 },
     ], { memoryOnly: true, metricsOnly: true, compression: "none" }));
     assert.equal(result.memoryOnly, true);
     assert.equal(Buffer.from(result.entries[0].dataBase64, "base64").toString("utf8"), body);
     assert.equal(result.entries[0].sha256, sha256);
     assert.deepEqual(fs.readdirSync(root), []);
-  } finally { __test.setMappedDownloadTransport(null); }
+  } finally { suite.setTransport(null); }
 });
 
 test("memory-only metrics reject missing evidence and oversized batches before transport", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-limit-"));
   let calls = 0;
-  __test.setMappedDownloadTransport(() => { calls++; return tarStream([]); });
+  suite.setTransport(() => { calls++; return tarStream([]); });
   try {
-    const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+    const method = suite.callMapped;
     const base = { remotePath: "metrics.csv", localRelativePath: "unused/raw.csv", bytes: 5, sha256: "a".repeat(64) };
     for (const fault of [{ sha256: "" }, { bytes: null }, { bytes: 4 * 1024 * 1024 + 1 }, { remotePath: "weights.pth" }]) {
       await assert.rejects(method(baseParams(root, [{ ...base, ...fault }], { memoryOnly: true, metricsOnly: true, compression: "none" })), /指标|上限|SHA256|大小|权重|检查点/);
     }
     await assert.rejects(method(baseParams(root, [{ ...base, bytes: 3 * 1024 * 1024 }, { ...base, remotePath: "other.csv", localRelativePath: "unused/other.csv", bytes: 3 * 1024 * 1024 }], { memoryOnly: true, metricsOnly: true })), /批次|总大小|上限/);
     assert.equal(calls, 0); assert.deepEqual(fs.readdirSync(root), []);
-  } finally { __test.setMappedDownloadTransport(null); }
+  } finally { suite.setTransport(null); }
 });
 
 test("memory-only cross-Plan metrics use one gzip stream without publishing raw files", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-gzip-"));
   const bodies = ["case,seed,value\n样例,42,0.9\n", "case,seed,value\n另一个,43,0.8\n"];
   const entries = bodies.map((body, index) => ({ remotePath: `work_dirs/plan-${index}/test_results/metrics.csv`, localRelativePath: `unused/${index}.csv`,
@@ -144,50 +165,54 @@ test("memory-only cross-Plan metrics use one gzip stream without publishing raw 
   const plan = __test.normalizeMappedDownloadEntries(params);
   let streams = 0;
   try {
-    __test.setMappedDownloadTransport(async () => {
+    suite.setTransport(async () => {
       streams++;
       const chunks = [];
       for await (const chunk of tarStream(bodies.map((body, index) => ({ name: `mapped/${index}`, body })))) chunks.push(chunk);
       return __test.openMappedDownloadStream({ sftp: server(), plan, localPath: root,
         spawnImpl: () => fakeSsh([require("node:zlib").gzipSync(Buffer.concat(chunks))], 0) });
     });
-    const result = await __test.createLocalApiMethods()["sync.downloadMappedPaths"](params);
+    const result = await suite.callMapped(params);
     assert.equal(streams, 1); assert.equal(result.compression, "gzip");
     assert.deepEqual(result.entries.map(file => Buffer.from(file.dataBase64, "base64").toString("utf8")), bodies);
     assert.deepEqual(fs.readdirSync(root), []);
-  } finally { __test.setMappedDownloadTransport(null); }
+  } finally { suite.setTransport(null); }
 });
 
 test("memory-only metrics reject corrupt content, incomplete tar and failed SSH without publishing bytes", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-failure-"));
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const method = suite.callMapped;
   const body = "metric,value\nAUC,0.9\n";
   const entry = { remotePath: "metrics.csv", localRelativePath: "unused/raw.csv", bytes: Buffer.byteLength(body), sha256: require("crypto").createHash("sha256").update(body).digest("hex") };
   try {
-    __test.setMappedDownloadTransport(() => tarStream([{ name: "mapped/0", body: body.replace("0.9", "0.1") }]));
+    suite.setTransport(() => tarStream([{ name: "mapped/0", body: body.replace("0.9", "0.1") }]));
     await assert.rejects(method(baseParams(root, [entry], { memoryOnly: true, metricsOnly: true, compression: "none" })), /SHA256/);
-    __test.setMappedDownloadTransport(() => Readable.from([tarHeader("mapped/0", entry.bytes), Buffer.from(body)]));
+    suite.setTransport(() => Readable.from([tarHeader("mapped/0", entry.bytes), Buffer.from(body)]));
     await assert.rejects(method(baseParams(root, [entry], { memoryOnly: true, metricsOnly: true, compression: "none" })), /尾部|中断|tar/);
-    __test.setMappedDownloadTransport(() => { const stream = tarStream([{ name: "mapped/0", body }]); stream.sshExit = Promise.resolve().then(() => { throw new Error("SSH failed"); }); stream.sshExit.catch(() => {}); return stream; });
+    suite.setTransport(() => { const stream = tarStream([{ name: "mapped/0", body }]); stream.sshExit = Promise.resolve().then(() => { throw new Error("SSH failed"); }); stream.sshExit.catch(() => {}); return stream; });
     await assert.rejects(method(baseParams(root, [entry], { memoryOnly: true, metricsOnly: true, compression: "none" })), /SSH failed/);
     assert.deepEqual(fs.readdirSync(root), []);
-  } finally { __test.setMappedDownloadTransport(null); }
+  } finally { suite.setTransport(null); }
 });
 
 test("cancelled memory-only metrics release the stream and never create a raw cache", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-cancel-"));
   const body = "metric,value\nAUC,0.9\n";
   const token = { isCancellationRequested: false, onCancellationRequested(fn) { this.listener = fn; } };
   try {
-    __test.setMappedDownloadTransport(() => {
+    suite.setTransport(() => {
       token.isCancellationRequested = true; token.listener?.();
       return tarStream([{ name: "mapped/0", body }]);
     });
-    await assert.rejects(__test.createLocalApiMethods()["sync.downloadMappedPaths"](baseParams(root, [{ remotePath: "metrics.csv", localRelativePath: "unused/raw.csv",
+    await assert.rejects(suite.callMapped(baseParams(root, [{ remotePath: "metrics.csv", localRelativePath: "unused/raw.csv",
       bytes: Buffer.byteLength(body), sha256: require("crypto").createHash("sha256").update(body).digest("hex") }], { memoryOnly: true, metricsOnly: true, compression: "none", token })), /取消/);
     assert.deepEqual(fs.readdirSync(root), []);
     assert.equal(__test.listActiveTransfers().some(transfer => transfer.operation === "映射批量下载"), false);
-  } finally { __test.setMappedDownloadTransport(null); }
+    // 夹具沙箱内的传输注册表同样必须随取消释放（真实模块注册表不能被夹具污染）。
+    assert.equal(suite.activeTransfers.size, 0, "沙箱传输注册表在取消后必须为空");
+  } finally { suite.setTransport(null); }
 });
 
 function keep(dir) {
@@ -263,14 +288,16 @@ function baseParams(root, entries, extra = {}) {
 }
 
 test.afterEach(() => {
+  // 仅清理真实模块传输替身（夹具的传输本就是沙箱内私有，不泄漏）。
   __test.setMappedDownloadTransport(null);
 });
 
 test("mapped download writes distinct local paths from one tar stream", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-"));
   keep(root);
   let calls = 0;
-  __test.setMappedDownloadTransport((request) => {
+  suite.setTransport((request) => {
     calls += 1;
     assert.equal(request.entries.length, 3);
     assert.deepEqual(request.entries.map((entry) => entry.archiveName), ["mapped/0", "mapped/1", "mapped/2"]);
@@ -284,7 +311,7 @@ test("mapped download writes distinct local paths from one tar stream", async ()
       { name: "mapped/2", body: "gamma" },
     ]);
   });
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const method = suite.callMapped;
   const result = await method(baseParams(root, [
     { remotePath: "simple_cluster/results/run-a/metrics.csv", localRelativePath: "experiments/results/formal/run-a.csv" },
     { remotePath: "simple_cluster/results/run-b/summary.json", localRelativePath: "experiments/results/formal/nested/run-b.json" },
@@ -304,11 +331,12 @@ test("mapped download writes distinct local paths from one tar stream", async ()
 });
 
 test("mapped download rejects unsafe entries before opening a stream", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-reject-"));
   keep(root);
   let calls = 0;
-  __test.setMappedDownloadTransport(() => { calls += 1; return tarStream([]); });
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  suite.setTransport(() => { calls += 1; return tarStream([]); });
+  const method = suite.callMapped;
   const good = { remotePath: "results/a.csv", localRelativePath: "out/a.csv" };
   await assert.rejects(method(baseParams(root, [{ remotePath: "/etc/passwd", localRelativePath: "out/a.csv" }])), /相对文件路径/);
   await assert.rejects(method(baseParams(root, [{ remotePath: "results/../secret.csv", localRelativePath: "out/a.csv" }])), /越界/);
@@ -320,6 +348,7 @@ test("mapped download rejects unsafe entries before opening a stream", async () 
 });
 
 test("mapped download blocks an existing symlink before any write", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-link-"));
   keep(root);
   const outside = path.join(path.dirname(root), `outside-dir-${path.basename(root)}`);
@@ -327,8 +356,8 @@ test("mapped download blocks an existing symlink before any write", async () => 
   fs.writeFileSync(path.join(outside, "a.csv"), "untouched");
   fs.symlinkSync(outside, path.join(root, "out"), "junction");
   let calls = 0;
-  __test.setMappedDownloadTransport(() => { calls += 1; return tarStream([{ name: "mapped/0", body: "nope" }]); });
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  suite.setTransport(() => { calls += 1; return tarStream([{ name: "mapped/0", body: "nope" }]); });
+  const method = suite.callMapped;
   await assert.rejects(method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
   ], { overwrite: true })), /符号链接/);
@@ -337,12 +366,13 @@ test("mapped download blocks an existing symlink before any write", async () => 
 });
 
 test("mapped download refuses an untrusted tar path and does not create it", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-tar-"));
   keep(root);
-  __test.setMappedDownloadTransport(() => tarStream([
+  suite.setTransport(() => tarStream([
     { name: "results/a.csv", body: "escaped" },
   ]));
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const method = suite.callMapped;
   await assert.rejects(method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "safe/a.csv" },
   ])), /映射校验/);
@@ -351,12 +381,13 @@ test("mapped download refuses an untrusted tar path and does not create it", asy
 });
 
 test("mapped download reports a truncated stream without claiming completion", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-fail-"));
   keep(root);
-  __test.setMappedDownloadTransport(() => tarStream([
+  suite.setTransport(() => tarStream([
     { name: "mapped/0", body: "only-one" },
   ]));
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const method = suite.callMapped;
   const error = await method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
     { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
@@ -369,13 +400,14 @@ test("mapped download reports a truncated stream without claiming completion", a
 });
 
 test("mapped download cancel stops before claiming the batch finished", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-cancel-"));
   keep(root);
   const token = {
     isCancellationRequested: false,
     onCancellationRequested(listener) { this.listener = listener; },
   };
-  __test.setMappedDownloadTransport(() => {
+  suite.setTransport(() => {
     token.isCancellationRequested = true;
     if (token.listener) token.listener();
     return tarStream([
@@ -383,7 +415,7 @@ test("mapped download cancel stops before claiming the batch finished", async ()
       { name: "mapped/1", body: "second" },
     ]);
   });
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const method = suite.callMapped;
   await assert.rejects(method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
     { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
@@ -391,12 +423,13 @@ test("mapped download cancel stops before claiming the batch finished", async ()
 });
 
 test("mapped download overwrites an existing regular file only after overwrite is set", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-overwrite-"));
   keep(root);
   fs.mkdirSync(path.join(root, "out"));
   fs.writeFileSync(path.join(root, "out", "a.csv"), "old");
-  __test.setMappedDownloadTransport(() => tarStream([{ name: "mapped/0", body: "new" }]));
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  suite.setTransport(() => tarStream([{ name: "mapped/0", body: "new" }]));
+  const method = suite.callMapped;
   const entries = [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }];
   await assert.rejects(method(baseParams(root, entries)), /未确认覆盖/);
   assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "old");
@@ -406,6 +439,7 @@ test("mapped download overwrites an existing regular file only after overwrite i
 });
 
 test("interrupted SSH stream settles while the reader is waiting for bytes", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-hang-"));
   keep(root);
   fs.mkdirSync(path.join(root, "out"));
@@ -418,8 +452,8 @@ test("interrupted SSH stream settles while the reader is waiting for bytes", asy
     entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
   });
   const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
-  __test.setMappedDownloadTransport(() => __test.openMappedDownloadStream({
+  const method = suite.callMapped;
+  suite.setTransport(() => __test.openMappedDownloadStream({
     sftp,
     plan,
     localPath: root,
@@ -452,12 +486,13 @@ test("interrupted SSH stream settles while the reader is waiting for bytes", asy
 });
 
 test("nonzero SSH exit after a valid tar rejects with transfer stage", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-ssh-"));
   keep(root);
   const payload = tarStream([{ name: "mapped/0", body: "kept-out" }]);
   const chunks = [];
   for await (const chunk of payload) chunks.push(chunk);
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const method = suite.callMapped;
   let sshCalls = 0;
   const started = Date.now();
   const plan = __test.normalizeMappedDownloadEntries({
@@ -465,7 +500,7 @@ test("nonzero SSH exit after a valid tar rejects with transfer stage", async () 
     entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
   });
   const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
-  __test.setMappedDownloadTransport(() => __test.openMappedDownloadStream({
+  suite.setTransport(() => __test.openMappedDownloadStream({
     sftp,
     plan,
     localPath: root,
@@ -484,13 +519,14 @@ test("nonzero SSH exit after a valid tar rejects with transfer stage", async () 
 });
 
 test("success waits for SSH exit after the tar trailer", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-wait-"));
   keep(root);
   const payload = tarStream([{ name: "mapped/0", body: "ready" }]);
   const chunks = [];
   for await (const chunk of payload) chunks.push(chunk);
   let proc;
-  __test.setMappedDownloadTransport(() => {
+  suite.setTransport(() => {
     throw new Error("use spawn");
   });
   const plan = __test.normalizeMappedDownloadEntries({
@@ -498,7 +534,7 @@ test("success waits for SSH exit after the tar trailer", async () => {
     entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
   });
   const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
-  __test.setMappedDownloadTransport(() => __test.openMappedDownloadStream({
+  suite.setTransport(() => __test.openMappedDownloadStream({
     sftp,
     plan,
     localPath: root,
@@ -508,7 +544,7 @@ test("success waits for SSH exit after the tar trailer", async () => {
       return proc;
     },
   }));
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const method = suite.callMapped;
   let settled = false;
   const pending = method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
@@ -533,7 +569,14 @@ test("success waits for SSH exit after the tar trailer", async () => {
   assert.equal(result.fileCount, 1);
 });
 
-test("API cancel during the real SSH stream kills that one child", async () => {
+// 该用例走真实 createLocalApiMethods 派发器：生产 Extension Host 平台门禁（win32/darwin-arm64）、
+// 真实传输账本（beginTransferOperation）、transfers.cancel 路由与 settledOperations 结算
+// 都必须作用在真实模块注册表上，沙箱夹具无法替代，也不允许用全局平台伪装在 Linux 上"通过"。
+// 与 installPolicy 的 pwsh 门禁同类：由父 host_windows 在真实 Windows 执行并回传结果（交付清单已登记）。
+test("API cancel during the real SSH stream kills that one child", {
+  skip: process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64")
+    ? false : "需要真实受支持 Extension Host（Windows 或 macOS arm64）：真实平台门禁与账本集成由父 host_windows 真机执行",
+}, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-live-cancel-"));
   keep(root);
   const { PassThrough } = require("node:stream");
@@ -583,7 +626,7 @@ test("API cancel during the real SSH stream kills that one child", async () => {
     },
   }));
   const methods = __test.createLocalApiMethods();
-  const method = methods["sync.downloadMappedPaths"];
+  const method = params => methods["sync.downloadMappedPaths"](params);
   const pending = method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
     { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
@@ -607,6 +650,7 @@ test("API cancel during the real SSH stream kills that one child", async () => {
 });
 
 test("ancestor junction swapped after the first file is rejected before the second write", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-swap-"));
   keep(root);
   const outside = path.join(path.dirname(root), `outside-${path.basename(root)}`);
@@ -617,8 +661,8 @@ test("ancestor junction swapped after the first file is rejected before the seco
     { name: "mapped/1", body: "second" },
   ]);
   payload.sshExit = Promise.resolve({ sshCode: 0 });
-  __test.setMappedDownloadTransport(() => payload);
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  suite.setTransport(() => payload);
+  const method = suite.callMapped;
   const originalRename = fs.renameSync;
   fs.renameSync = function patched(from, to) {
     const result = originalRename.call(fs, from, to);
@@ -642,14 +686,15 @@ test("ancestor junction swapped after the first file is rejected before the seco
 });
 
 test("truncated stream keeps the previous destination and reports the partial sibling", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-preserve-"));
   keep(root);
   fs.mkdirSync(path.join(root, "out"));
   fs.writeFileSync(path.join(root, "out", "a.csv"), "last-good");
   const header = tarHeader("mapped/0", 4);
   const { Readable } = require("node:stream");
-  __test.setMappedDownloadTransport(() => Readable.from([header, Buffer.from("no")]));
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  suite.setTransport(() => Readable.from([header, Buffer.from("no")]));
+  const method = suite.callMapped;
   const error = await method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
   ], { overwrite: true })).then(() => { throw new Error("expected rejection"); }, (value) => value);
@@ -673,6 +718,7 @@ test("remote mapped script checks the file list before writing a tar", () => {
 });
 
 test("cross-Plan metrics download uses one gzip stream and waits for decompression before publishing", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-gzip-"));
   keep(root);
   const entries = [
@@ -682,7 +728,7 @@ test("cross-Plan metrics download uses one gzip stream and waits for decompressi
   const params = baseParams(root, entries, { compression: "auto" });
   const plan = __test.normalizeMappedDownloadEntries(params);
   let streams = 0;
-  __test.setMappedDownloadTransport(async ({ remoteCommand }) => {
+  suite.setTransport(async ({ remoteCommand }) => {
     assert.match(remoteCommand, /gzip\.GzipFile/);
     const chunks = [];
     for await (const chunk of tarStream([{ name: "mapped/0", body: "latest-a" }, { name: "mapped/1", body: "latest-b" }])) chunks.push(chunk);
@@ -692,7 +738,7 @@ test("cross-Plan metrics download uses one gzip stream and waits for decompressi
       spawnImpl: () => fakeSsh([require("node:zlib").gzipSync(Buffer.concat(chunks))], 0),
     });
   });
-  const result = await __test.createLocalApiMethods()["sync.downloadMappedPaths"](params);
+  const result = await suite.callMapped(params);
   assert.equal(streams, 1);
   assert.equal(result.compression, "gzip");
   assert.equal(result.fileCount, 2);
@@ -701,13 +747,14 @@ test("cross-Plan metrics download uses one gzip stream and waits for decompressi
 });
 
 test("a truncated gzip footer fails without replacing the current metrics file", async () => {
+  const suite = mappedSuite();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-gzip-truncated-"));
   keep(root);
   fs.mkdirSync(path.join(root, "out"));
   fs.writeFileSync(path.join(root, "out/a.csv"), "last-good", "utf8");
   const params = baseParams(root, [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }], { compression: "gzip", overwrite: true });
   const plan = __test.normalizeMappedDownloadEntries(params);
-  __test.setMappedDownloadTransport(async () => {
+  suite.setTransport(async () => {
     const chunks = [];
     for await (const chunk of tarStream([{ name: "mapped/0", body: "new" }])) chunks.push(chunk);
     const compressed = require("node:zlib").gzipSync(Buffer.concat(chunks));
@@ -716,6 +763,6 @@ test("a truncated gzip footer fails without replacing the current metrics file",
       spawnImpl: () => fakeSsh([compressed.subarray(0, compressed.length - 8)], 0),
     });
   });
-  await assert.rejects(__test.createLocalApiMethods()["sync.downloadMappedPaths"](params), /unexpected end|打包流|解包/);
+  await assert.rejects(suite.callMapped(params), /unexpected end|打包流|解包/);
   assert.equal(fs.readFileSync(path.join(root, "out/a.csv"), "utf8"), "last-good");
 });

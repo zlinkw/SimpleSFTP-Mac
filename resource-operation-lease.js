@@ -263,7 +263,7 @@ class ResourceOperationLeaseManager {
             }
             // Paired updates block admission, not the transfers already draining.
             // Existing owners still pass all ordinary ownership/heartbeat gates.
-            if (existingOperation && row.actionType === "mac-preview-update")
+            if (existingOperation && ["paired-plugin-update", "mac-preview-update"].includes(row.actionType))
                 return;
             const expiry = Date.parse(row.expiresAt) || (await fs.stat(this.leasePath)).mtimeMs + 30_000;
             if (expiry > this.now())

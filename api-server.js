@@ -8,6 +8,7 @@ const { atomicWriteText } = require("./state-store");
 const { HostOperationLeaseManager } = require("./host-operation-lease");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { READ_ONLY_SETTLEMENT_METHODS } = require("./transfer-settlement");
+const { TransferCapacity } = require("./transfer-capacity");
 const apiRequestContext = new AsyncLocalStorage();
 
 const LOOPBACK_REMOTE_ADDRESSES = new Set([
@@ -73,6 +74,11 @@ class LocalApiServer {
     this.maxEventBufferBytes = Math.max(256, Math.min(1024 * 1024, Number(options.maxEventBufferBytes) || 1024 * 1024));
     this.maxSsePendingBytes = Math.max(256, Math.min(1024 * 1024, Number(options.maxSsePendingBytes) || 1024 * 1024));
     this.activeRpc = 0;
+    // HTTP admission must not starve browsing or stop/status requests behind
+    // long file operations. Actual SSH work retains its per-server limits.
+    this.rpcLanes = { files: new TransferCapacity({ concurrency: 8 }),
+      browse: new TransferCapacity({ concurrency: 4 }), review: new TransferCapacity({ concurrency: 2 }), summary: new TransferCapacity({ concurrency: 4 }),
+      control: new TransferCapacity({ concurrency: 4 }) };
     this.discoveryLease = options.discoveryLease || new HostOperationLeaseManager();
   }
 
@@ -160,7 +166,6 @@ class LocalApiServer {
   }
 
   async handleRpc(request, response) {
-    if (this.activeRpc >= 8) { sendJson(response, 503, rpcError(undefined, 429, "API_CAPACITY_EXCEEDED")); return; }
     this.activeRpc += 1;
     try { await this.handleRpcCore(request, response); }
     finally { this.activeRpc -= 1; }
@@ -185,15 +190,28 @@ class LocalApiServer {
         return;
       }
       const controller = new AbortController();
-      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method);
-      const cancelRead = () => { if (readOnly) controller.abort(new Error("API_READ_CANCELLED")); };
+      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify", "files.cleanup.observeBatch"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method)
+        || payload.method === "sync.downloadMappedPaths" && payload.params?.memoryOnly === true;
+      let queued = true;
+      const cancelRead = () => { if (queued || readOnly) controller.abort(new Error("API_READ_CANCELLED")); };
       request.on("aborted", cancelRead); response.on("close", cancelRead);
       if (request.aborted || response.destroyed) cancelRead();
       let result;
       try {
-        result = await apiRequestContext.run({ readOnly, signal: controller.signal }, () => {
-          controller.signal.throwIfAborted();
-          return handler(normalParams(payload.params), this, { signal: controller.signal });
+        const lane = payload.method === 'sync.projectInventory' && payload.params?.metadataOnly === true ? 'summary'
+          : /^files\.cleanup\.(preview|inspect|check|verify)$/.test(payload.method) ? 'review'
+          : /^(sync\.project(?:Tree|TreeState|FileStats)|remote\.listDirs)$/.test(payload.method) ? 'browse'
+          : /^(sync\.|upload\.|download\.|agents\.|project\.|handoff\.|downloadScope\.|transfers\.reconcile$|files\.cleanup\.(?:preview|inspect|execute|verify))/.test(payload.method) ? 'files' : 'control';
+        result = await this.rpcLanes[lane].run([Symbol(payload.method)], controller.signal, () => {
+          queued = false;
+          return apiRequestContext.run({ readOnly, signal: controller.signal }, () => {
+            controller.signal.throwIfAborted();
+            return handler(normalParams(payload.params), this, { signal: controller.signal });
+          });
+        }).catch(error => {
+          if (queued) throw apiError(429, error.message === 'TRANSFER_CAPACITY_EXCEEDED' ? 'API_CAPACITY_EXCEEDED' : error.message,
+            { method: payload.method, notStarted: true, lane });
+          throw error;
         });
       } finally { request.removeListener("aborted", cancelRead); response.removeListener("close", cancelRead); }
       if (id === undefined) {
@@ -415,6 +433,8 @@ class LocalApiServer {
       port: this.port,
       startedAt: this.startedAt,
       status: this.disposed ? "stopped" : "running",
+      rpcLanes: Object.fromEntries(Object.entries(this.rpcLanes).map(([name, pool]) =>
+        [name, { active: pool.active, queued: pool.pending.length, limit: pool.concurrency }])),
     };
   }
 
@@ -424,9 +444,10 @@ class LocalApiServer {
       name: this.name,
       version: this.version,
       instanceId: this.instanceId(),
-      features: { transferSettlementReceipts: true,
-        ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true, transferReconciliationStoredIdentity: true,
-          transferReconciliationMethods: ["sync.serverToServerFpsync", "upload.files", ...READ_ONLY_SETTLEMENT_METHODS] } : {}),
+      features: { transferSettlementReceipts: true, metadataReadsTransient: true, projectTreeExistenceQuery: true, rpcLaneIsolation: 1,
+        ...(this.methodOptions["sync.projectInventory"]?.idlePolicy === "observe-filesystem" ? { fileOperationIdleObservation: 1 } : {}),
+        ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true,
+          transferReconciliationMethods: ["sync.serverToServerFpsync", ...READ_ONLY_SETTLEMENT_METHODS] } : {}),
         ...(this.methodOptions["sync.projectInventory"]?.scopeTransport === "stdin" ? { projectInventoryStdinScopes: true } : {}) },
       transport: ["http", "cli"],
       rpc: "json-rpc-2.0",

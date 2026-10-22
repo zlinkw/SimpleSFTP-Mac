@@ -156,9 +156,9 @@ test("disposal preserves a newer discovery and consumes its own fixed writing sl
 
 test("disconnected readers cancel while writes remain owned by durable operations", async () => {
   const { EventEmitter } = require("node:events");
-  for (const [method, readOnly] of [["project.inventory", true], ["sync.projectInventory", true], ["sync.projectFileStats", true],
+  for (const [method, readOnly, params = {}] of [["project.inventory", true], ["sync.projectInventory", true], ["sync.projectInventory", true, {metadataOnly:true}], ["sync.projectFileStats", true],
       ["sync.projectTree", true], ["sync.planLogPaths", true], ["transfers.reconcile", true], ["upload.start", false],
-      ["sync.serverToServerFpsync", false]]) {
+      ["sync.serverToServerFpsync", false], ["sync.downloadMappedPaths", true, {memoryOnly:true}], ["sync.downloadMappedPaths", false]]) {
     let entered, release, captured;
     const ready = new Promise(resolve => { entered = resolve; });
     const server = new LocalApiServer({ methods: { [method]: async (_params, _server, context) => {
@@ -167,10 +167,120 @@ test("disconnected readers cancel while writes remain owned by durable operation
     const request = new EventEmitter(), response = new EventEmitter();
     response.writeHead = () => {}; response.end = () => {};
     const pending = server.handleRpc(request, response);
-    request.emit("data", Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: {} }))); request.emit("end");
+    request.emit("data", Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }))); request.emit("end");
     await ready; response.emit("close");
     assert.equal(captured.aborted, readOnly); release({ ok: true }); await pending;
     assert.equal(server.activeRpc, 0); await server.dispose();
+  }
+});
+
+test('busy file RPCs leave directory browsing and operation controls available', async () => {
+  const { EventEmitter } = require('node:events');
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  let starts = 0, serviceStarts = 0;
+  const api = new LocalApiServer({ methods: {
+    'sync.projectInventory': async (params) => { if(params.metadataOnly)return {comparisonBasis:'metadata'};starts++; await gate; return {}; },
+    'sync.projectTree': async () => ({ entries: [] }),
+    'transfers.list': async () => ({ transfers: [] }),
+    'files.cleanup.preview': async () => ({ reviewed: true }),
+    'upload.files': async () => { assert.fail('disconnected queued write started'); },
+    'agents.lifecycle': async () => { serviceStarts++; await gate; return {}; },
+  } });
+  function rpc(method, params = {}) {
+    const req = new EventEmitter(), res = new EventEmitter();
+    let body, status;
+    res.writeHead = code => { status = code; }; res.end = text => { body = JSON.parse(text); };
+    const done = api.handleRpc(req, res);
+    req.emit('data', Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: starts, method, params }))); req.emit('end');
+    return { done, res, result: () => ({ body, status }) };
+  }
+  const pending = Array.from({ length: 8 }, () => rpc('sync.projectInventory'));
+  try {
+    await new Promise(setImmediate); assert.equal(starts, 8);
+    const tree = rpc('sync.projectTree'), control = rpc('transfers.list'), review = rpc('files.cleanup.preview');
+    await Promise.all([tree.done, control.done, review.done]);
+    assert.deepEqual(tree.result().body.result, { entries: [] });
+    assert.deepEqual(control.result().body.result, { transfers: [] });
+    assert.deepEqual(review.result().body.result, { reviewed: true });
+    const summary = rpc('sync.projectInventory',{metadataOnly:true});await summary.done;
+    assert.equal(summary.result().body.result.comparisonBasis,'metadata','recursive stat reads bypass eight occupied bulk RPC slots');
+    const cancelled = rpc('sync.projectInventory');
+    await new Promise(setImmediate); assert.equal(starts, 8, 'ninth file query is queued');
+    cancelled.res.emit('close'); await cancelled.done;
+    assert.equal(starts, 8, 'a disconnected queued query must not start');
+    const write = rpc('upload.files'); await new Promise(setImmediate);
+    write.res.emit('close'); await write.done;
+    assert.equal(write.result().body.error.data.notStarted, true);
+    const services = Array.from({length:4},()=>rpc('agents.lifecycle'));
+    try {
+      await new Promise(setImmediate);assert.equal(serviceStarts,0);
+      const available = rpc('transfers.list');await available.done;
+      assert.deepEqual(available.result().body.result,{transfers:[]});
+    } finally {for(const item of services)item.res.emit('close');await Promise.all(services.map(p=>p.done));}
+    const overflow = Array.from({length:65}, () => rpc('sync.projectInventory'));
+    try {
+      await overflow.at(-1).done;
+      assert.equal(overflow.at(-1).result().body.error.message, 'API_CAPACITY_EXCEEDED');
+      assert.equal(overflow.at(-1).result().body.error.data.notStarted, true);
+      assert.equal(api.health().rpcLanes.files.queued,64);
+    } finally { for (const item of overflow) item.res.emit('close'); await Promise.all(overflow.map(p=>p.done)); }
+  } finally { release(); await Promise.all(pending.map(p => p.done)); await api.dispose(); }
+  assert.equal(api.activeRpc, 0);
+});
+
+test('CLI file RPC has no socket inactivity cutoff while small controls remain bounded', async () => {
+  const Module = require('node:module');
+  const { EventEmitter } = require('node:events');
+  const cliSource = fs.readFileSync(path.join(__dirname, '../bin/simple-sftp-api.js'), 'utf8');
+  assert.match(cliSource, /callLocalRpc\(readDiscovery, method, params\)/, 'CLI must route every method through the shared local API client');
+  const discovery = { baseUrl: 'http://127.0.0.1:1/', token: 'fixture-token', name: 'SimpleSFTP Test', version: '0.2.0-test', status: 'running', pid: process.pid, startedAt: 'fixture' };
+  const methods = ['sync.projectInventory', 'sync.projectTreeState', 'files.cleanup.execute', 'sync.downloadMappedPaths', 'upload.files', 'project.create', 'handoff.markReady', 'downloadScope.configure', 'status'];
+  const seen = [];
+  const originalLoad = Module._load;
+  Module._load = function (name, ...args) {
+    if (name !== 'node:http') return originalLoad.call(this, name, ...args);
+    return { request(options, receive) {
+      seen.push(options);
+      const req = new EventEmitter();
+      req.destroy = () => {};
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        receive(res);
+        const body = options.path === '/api/v1/capabilities'
+          ? { schemaVersion: 1, rpc: 'json-rpc-2.0', name: discovery.name, version: discovery.version, methods }
+          : { jsonrpc: '2.0', id: 1, result: { ok: true } };
+        res.emit('data', Buffer.from(JSON.stringify(body)));
+        res.emit('end');
+      };
+      return req;
+    } };
+  };
+  const clientPath = require.resolve('../mac-api-client');
+  const realSetTimeout = global.setTimeout;
+  const realClearTimeout = global.clearTimeout;
+  const timers = [];
+  delete require.cache[clientPath];
+  try {
+    global.setTimeout = (fn, ms) => { timers.push(ms); return 0; };
+    global.clearTimeout = () => {};
+    const { callLocalRpc } = require('../mac-api-client');
+    const readDiscovery = () => ({ ...discovery });
+    for (const method of methods.filter((item) => item !== 'status')) {
+      timers.length = 0; seen.length = 0;
+      await callLocalRpc(readDiscovery, method, {});
+      assert.equal(seen.at(-1).path, '/api/v1/rpc');
+      assert.deepEqual(timers, [15000], `${method}: only the bounded capabilities probe may arm a timer; the file RPC itself must never be cut off`);
+    }
+    timers.length = 0; seen.length = 0;
+    await callLocalRpc(readDiscovery, 'status', {});
+    assert.equal(seen.at(-1).path, '/api/v1/rpc');
+    assert.deepEqual(timers, [15000, 15000], 'small controls stay bounded while waiting');
+  } finally {
+    global.setTimeout = realSetTimeout;
+    global.clearTimeout = realClearTimeout;
+    Module._load = originalLoad;
+    delete require.cache[clientPath];
   }
 });
 
@@ -356,7 +466,9 @@ test("SimpleSFTP uploads have connect timeout, progress inactivity, cancellation
   assert.match(extensionSource, /defaultConnectTimeoutSeconds = 15/);
   assert.match(extensionSource, /"-o", `ConnectTimeout=\$\{connectTimeout\}`/);
   assert.match(extensionSource, /ProgressInactivity/);
-  assert.equal(require("../package.json").contributes.configuration.properties["simpleSftpMac.uploadTimeoutSeconds"].description.includes("不再限制业务总时长"), true);
+  const uploadTimeoutDescription = require("../package.json").contributes.configuration.properties["simpleSftpMac.uploadTimeoutSeconds"].description;
+  assert.match(uploadTimeoutDescription, /不限制传输总时长/);
+  assert.match(uploadTimeoutDescription, /实际文件.*用户可取消/);
   assert.match(extensionSource, /cancellable: uploadProgressCancellable/);
   assert.match(extensionSource, /transfer\.cancel\(/);
   assert.match(extensionSource, /"transfers\.list": async/);

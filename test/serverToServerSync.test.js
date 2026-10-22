@@ -40,6 +40,8 @@ test('delta stream transfers changed content only and reports compared versus ch
   const sandbox = { Date, String, Number, Set, Map, Array, Object, Math, Error,
     requestedTransferCompression: () => 'none', directSyncTarget: value => value, directSyncRelativePath: value => value,
     transferTimeoutMs: () => 120000, transferContext: { getStore: () => controller },
+    // Mac 产品核对在清单前执行原生认证握手；Windows 派生切片测试需声明该 Mac 步骤已完成。
+    ensureMacTransferAuthentication: async () => {},
     selectTransferCompression: async () => ({ compression: 'none' }), FPSYNC_PARALLEL_STREAMS: 2, FPSYNC_MAX_BATCH_BYTES: 512 * 1024 * 1024,
     partitionTransferPaths: __test.partitionTransferPaths, compressionHistory: { key() {}, record() {} },
     inspectRemoteBatchFiles: async target => ({ files: target.host === 'source' || transferred ? files : {

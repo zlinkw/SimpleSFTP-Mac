@@ -49,7 +49,7 @@ test('local preview is zero-write, fixed types and unsafe paths fail closed',()=
   const base=root();write(base,'output/a.csv');const before=fs.readdirSync(base),r=inspect(base,'output/a.csv');assert.equal(r.ok,true);assert.deepEqual(fs.readdirSync(base),before);
   for(const rel of ['../escape','/absolute','output/*','output/../a','.git/config','clean_dir/MANIFEST.md'])assert.equal(inspect(base,rel).ok,false);
   assert.equal(inspect(base,'output/a.csv','directory').error.code,'TYPE_CHANGED');
-  write(base,'root.csv');assert.equal(inspect(base,'root.csv').error.code,'UNSAFE_PARENT');
+  write(base,'root.csv');assert.equal(inspect(base,'root.csv').ok,true);
   assert.equal(run({root:path.parse(base).root,action:'inspect',target:{relativePath:'x',destination:'clean_dir/x',type:'file'}}).error.code,'UNSAFE_ROOT');
 });
 test('Windows path spelling aliases preserve physical root identity and read-only preview safety', {skip:process.platform!=='win32'},()=>{

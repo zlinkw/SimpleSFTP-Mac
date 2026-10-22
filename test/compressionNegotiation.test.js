@@ -3,8 +3,11 @@ const assert = require("node:assert/strict");
 const Module = require("node:module");
 const original = Module._load;
 Module._load = function (name, ...args) { return name === "vscode" ? { TreeItem: class {}, ProgressLocation: { Notification: 1 }, window: { withProgress: (_o, f) => f({ report() {} }) }, workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) } } : original.call(this, name, ...args); };
+// Linux 门禁无 AppData 写权限：把租约根指到本测试进程的临时目录（仅改环境变量，不改生产代码）。
+process.env.APPDATA = require("node:fs").mkdtempSync(require("node:path").join(require("node:os").tmpdir(), "simple-sftp-gate-lease-"));
 const { __test: api } = require("../extension");
 Module._load = original;
+const { createTransferHarness } = require("./_helpers/supportedHostPlatform");
 const source = { host: "source", username: "user", port: 22, remotePath: "/project" };
 const target = { ...source, host: "target" };
 const sample = { sampleBytes: 65536, sampleMs: 10, gzip: { bytes: 1000, cpuMs: 0.3, wallMs: 0.3 }, zstd: { bytes: 700, cpuMs: 0.1, wallMs: 0.1 } };
@@ -83,23 +86,29 @@ test("measured link cost selects none and local downloads limit candidates to gz
 });
 test("full cross-Plan pipeline uses the sampled encoder and keeps hash authority", async () => {
   const files = ["work/a/one.csv", "work/b/two.csv"];
-  let inspections = 0, packed = 0;
-  api.setCompressionProbeTransport(async (_endpoint, command) => command.startsWith("command -v") ? "supported" : JSON.stringify(sample));
-  api.setRemoteBatchTransport(async (endpoint, command, paths) => {
-    if (command.includes("tar --null")) {
+  let destinationInspections = 0, packed = 0;
+  // 隔离夹具：真实压缩协商链（chooseSampleFiles/chooseCompression/compression-sample.py）切片进沙箱，
+  // win32 批量通道事实仅在沙箱内注入；探针与批量传输都是显式注入的传输替身。
+  const { sandbox } = createTransferHarness({
+    platform: "win32", probe: true,
+    batch: async (endpoint, command, paths) => {
       packed++;
       assert.match(command, /zstd -T2 -6 -c/);
       assert.match(command, /zstd -dc/);
       assert.match(command, /SIMPLE_COMPRESSION_WIRE/);
       assert.match(command, /simple_sftp_staged_receive/);
       assert.doesNotMatch(command, /rm -rf|os\.rmdir\(|os\.unlink\(/);
-      assert.deepEqual(paths, files);
+      assert.deepEqual(Array.from(paths), files);
       return "";
-    }
-    inspections++;
-    return JSON.stringify({ files: Object.fromEntries(paths.map(p => [p, { sha256: endpoint.host === "target" && inspections <= 2 ? "b".repeat(64) : "a".repeat(64), size: 10000 }])) });
+    },
+    fpsync: { inspect: async (endpoint, paths) => {
+      destinationInspections += endpoint.host === "target" ? 1 : 0;
+      const sha256 = endpoint.host === "target" && destinationInspections === 1 ? "b".repeat(64) : "a".repeat(64);
+      return { files: Object.fromEntries(paths.map(p => [p, { sha256, size: 10000 }])) };
+    } },
   });
-  const result = await api.syncServerToServerFpsyncCore({ source, destination: target, relativePaths: files, singleStream: true, confirm: true, pathConfirmed: true }, { report() {} });
+  sandbox.compressionProbeTransport = async (_endpoint, command) => command.startsWith("command -v") ? "supported" : JSON.stringify(sample);
+  const result = await sandbox.syncServerToServerFpsyncCore({ source, destination: target, relativePaths: files, singleStream: true, confirm: true, pathConfirmed: true }, { report() {} });
   assert.equal(packed, 1);
   assert.equal(result.compression, "zstd");
   assert.equal(result.verification, "sha256");
@@ -117,16 +126,17 @@ test("manifest argument bytes remain bounded even when file contents are tiny", 
 test("LAN archives group up to 512 MiB without allocating entire file contents", async () => {
   const files = Array.from({ length: 6 }, (_, index) => `work/current/weight-${index}.pth`);
   const packed = [], progress = [];
-  api.setRemoteBatchTransport(async (_endpoint, command, paths) => {
+  // 隔离夹具：win32 批量通道事实仅在沙箱内注入，分组/并发/进度语义全部来自真实编排切片。
+  const { sandbox } = createTransferHarness({ platform: "win32", batch: async (_endpoint, command, paths) => {
     assert.match(command, /tar --null/);
-    packed.push([...paths]);
+    packed.push(Array.from(paths));
     if (paths.length > 1) await new Promise(setImmediate);
     return "";
-  });
-  const partitions = await api.transferPartitionedTar(source, target, files, 5000, row=>progress.push(row), {
+  } });
+  const partitions = await sandbox.transferPartitionedTar(source, target, files, 5000, row=>progress.push(row), {
     compression: "none", singleStream: true,
     fileSizes: Object.fromEntries(files.map(file => [file, 100 * 1024 * 1024])),
-    expectedFiles: Object.fromEntries(files.map(file => [file, {size:100 * 1024 * 1024,sha256:"a".repeat(64)}])),
+    expectedFiles: Object.fromEntries(files.map(file => [file, { size: 100 * 1024 * 1024, sha256: "a".repeat(64) }])),
   });
   assert.equal(partitions,2);
   assert.deepEqual(packed.map(group=>group.length).sort((a,b)=>a-b),[1,5]);

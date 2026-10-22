@@ -1,15 +1,29 @@
 const vscode = require("vscode");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { ProgressInactivity } = require("./progress-inactivity");
+const { startRemoteFileProgress } = require("./transfer-file-progress");
 const { LatestSnapshotWriter } = require("./latest-snapshot-writer");
 const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
+const metadataTreeCapacity = new TransferCapacity();
+const metadataInventoryCapacity = new TransferCapacity();
+const cleanupReadCapacity = new TransferCapacity();
+// Short, exact code checks cannot queue behind a recursive artifact inventory.
+// Each lane remains bounded to two servers globally and one read per server.
+const codeInventoryCapacity = new TransferCapacity();
+// Memory-only metrics are capped at 4 MiB by the existing normalizer/extractor.
+// They cannot hold up, or queue behind, bulk hashes and disk-writing transfers.
+const memoryResultCapacity = new TransferCapacity();
+let projectTreeTransport;
 let extensionDeactivating = false;
 const { chooseSampleFiles, chooseCompression, CompressionHistory, SAMPLE_TIMEOUT_MS } = require("./compression-policy");
 const compressionSampleScript = require("node:fs").readFileSync(require("node:path").join(__dirname, "compression-sample.py"), "utf8");
 const compressionHistory = new CompressionHistory();
 let compressionProbeTransport = null;
 const transferContext = new AsyncLocalStorage();
+// 清理守卫需要判断「当前这次调用是不是它自己」；排队中的请求可能丢失 transferContext 异步链，
+// 因此在真正执行 handler 的那一层再登记一次控制器对象（仅进程内事实，不落盘、不出现在响应里）。
+const apiRouteController = new AsyncLocalStorage();
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -21,7 +35,7 @@ const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation, normalizeMacRelativePath, localPathText, remotePathText } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, validateTarEntries, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
-const { CleanupFileApi, fail: cleanupFail } = require("./cleanup-file-api");
+const { CleanupFileApi, fail: cleanupFail, transferBusySnapshot, runtimePrepareRequest, remoteRuntimePrepareCommand, remoteRuntimeCommand } = require("./cleanup-file-api");
 let cleanupFileApi;
 const {
   HostOperationLeaseConflictError,
@@ -29,7 +43,9 @@ const {
 } = require("./host-operation-lease.js");
 const PACKAGE_JSON = require("./package.json");
 const { MacAuthentication, sshAuthArgs } = require("./mac-auth");
+const { createTunnelAuthBridge } = require("./mac-tunnel-auth");
 let macAuthentication;
+let tunnelAuthBridge;
 const APPDATA = require("./mac-paths").applicationDataRoot();
 const SHARED_SERVER_DIR = path.join(APPDATA, "SimpleSFTPMac", "server-profiles");
 const SHARED_SERVER_FILE = path.join(SHARED_SERVER_DIR, "servers.json");
@@ -170,6 +186,16 @@ async function activate(context) {
     macAuthentication = new MacAuthentication(context, vscode.window);
     await macAuthentication.start();
   }
+  // Narrow authentication bridge for the paired Experiment Mac system-OpenSSH launcher;
+  // the authentication service itself only exists on Mac and prompts stay in this extension.
+  tunnelAuthBridge = createTunnelAuthBridge(() => macAuthentication);
+  context.subscriptions.push(
+    vscode.commands.registerCommand("simpleSftpMac.acquireTunnelAuthentication", async options => {
+      if (!tunnelAuthBridge) throw new Error("SimpleSFTP Mac 隧道认证桥已停用。");
+      return tunnelAuthBridge.acquire(options || {});
+    }),
+    vscode.commands.registerCommand("simpleSftpMac.releaseTunnelAuthentication", async nonce => ({ ok: Boolean(tunnelAuthBridge) && tunnelAuthBridge.release(nonce) })),
+  );
   loadTransferOperationLedger();
   refreshConnectTimeoutFromConfig();
   const command = vscode.commands.registerCommand(
@@ -188,6 +214,7 @@ async function activate(context) {
     "simpleSftpMac.uploadFiles",
     (options) => uploadFiles(options)
   );
+  context.subscriptions.push(vscode.commands.registerCommand("simpleSftpMac.agentLifecycle", options => agentLifecycle(options)));
   const selectServerCommand = vscode.commands.registerCommand(
     "simpleSftpMac.selectServer",
     () => selectServer()
@@ -278,14 +305,21 @@ async function activate(context) {
   startLocalApiServer(context);
 }
 
+
+function cleanupActivityGuard(selfController = apiRouteController.getStore()) {
+  // 守卫与只读 transfers.list 共用同一份纯内存投影；拒绝那一刻把快照放进 ACTIVE_TRANSFER 错误里。
+  // busy 已经排除被生产事实证明的只读观测，也排除当前调用自己的那一个控制器（自身执行隔离不得
+  // 把自己的 files.cleanup.execute 当成别人的忙）；其他任何在途传输仍按真实阻断处理。
+  const snapshot = currentTransferBusySnapshot(new Date().toISOString(), selfController);
+  if (snapshot.busy) cleanupFail("ACTIVE_TRANSFER", "ACTIVE_TRANSFER", { busy: snapshot });
+  return snapshot;
+}
+
 function startLocalApiServer(context) {
   cleanupFileApi = new CleanupFileApi({
     storageRoot: path.join(context.globalStorageUri.fsPath, "cleanup-operations"),
     transport: cleanupFileTransport,
-    activity: async () => {
-      if ([...activeTransfers.values()].some(row => !["completed", "failed", "cancelled"].includes(row.status))
-        || activeUploadOperations.size || uploadQueues.size) cleanupFail("ACTIVE_TRANSFER");
-    },
+    activity: async () => { cleanupActivityGuard(); },
     lease: (node, targets, work) => withFileResourceLease("PLAN 安全清理", node.root, [""],
       node.kind === "local" ? "local" : remoteResourceServer({ host: node.host, port: node.port }), work),
   });
@@ -295,18 +329,7 @@ function startLocalApiServer(context) {
     preferredPort: 19766,
     discoveryPath: path.join(APPDATA, "SimpleSFTPMac", "api.json"),
     methods: createLocalApiMethods(),
-    methodOptions: {
-      "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
-      "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
-      "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
-      "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
-      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1 },
-      "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
-      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true },
-      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
-      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
-      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
-    },
+    methodOptions: API_METHOD_CAPABILITIES,
   });
   localApiServer = server;
   context.subscriptions.push({
@@ -856,7 +879,7 @@ function removeLocalStagingDirectory(tempDir, options = {}) {
     : ["-c", 'cd -- "$1" || exit 75; test "$(pwd -P)" = "$2" || exit 75; rm -rf -- "./$3"', "sh", parent, safetyRoot, leaf];
   return new Promise((resolve, reject) => {
     const child = execFile(command, args, { cwd: parent, windowsHide: true, timeout: 0 }, (error) => error ? reject(error) : resolve());
-    const monitor = watchTransferProcess(child, reject, false);
+    const monitor = watchTransferProcess(child, reject, true);
     child.stdout?.on("data", monitor.receive);
   });
 }
@@ -1067,13 +1090,13 @@ async function projectInventory(options = {}) {
   if (scopePaths && scopePaths.length > 5000) throw new Error("一次清单最多 5000 个范围路径。");
   if (scopePaths && Buffer.byteLength(JSON.stringify(scopePaths), "utf8") > 1048576) throw new Error("清单范围超过 1 MiB。");
   if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("清单目录属于机器状态。");
-  const script = projectInventoryScript();
+  const script = projectInventoryScript(options.metadataOnly === true);
   const command = `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)} ${recursive ? "1" : "0"} ${shellQuote(scopePaths ? "@stdin" : "null")}`;
   const output = scopePaths ? await runRemoteBatchSsh(source, command, scopePaths, transferTimeoutMs(source, options), { remoteMutation: false, stage: "产物清单校验" })
     : await runSsh(source, command, transferTimeoutMs(source, options));
   const result = JSON.parse(output);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
-  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles, cacheRows: result.cacheRows, cacheStatus: result.cacheStatus };
+  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, ...(options.metadataOnly === true ? { comparisonBasis: "metadata" } : {}), hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles, cacheRows: result.cacheRows, cacheStatus: result.cacheStatus };
 }
 
 async function projectFileStats(options = {}) {
@@ -1109,7 +1132,7 @@ async function projectFileStats(options = {}) {
   return { ok: true, files: result.files, missing: Array.isArray(result.missing) ? result.missing : [] };
 }
 
-function projectInventoryScript() {
+function projectInventoryScript(metadataOnly = false) {
   return [
     "import hashlib,json,os,sqlite3,stat as statmod,sys,time,threading",
     "SQLITE_INT64_SPAN=1<<64",
@@ -1138,10 +1161,16 @@ function projectInventoryScript() {
     "  progress['bytes']+=byte_count; progress['files']+=file_count; now=time.monotonic()",
     "  if force or now-progress['at']>=0.25:",
     "   sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':progress['bytes'],'processedFiles':progress['files'],'cacheHits':reused,'cacheRehash':hashed,'cacheStatus':cache_status})+chr(10)); sys.stderr.flush(); progress['at']=now",
+    "scan_count=0; scan_at=0",
+    "def report_scan(count=0,force=False):",
+    " global scan_count,scan_at",
+    " scan_count+=count; now=time.monotonic()",
+    " if force or now-scan_at>=0.25:",
+    "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'preparing','processedFiles':scan_count})+chr(10)); sys.stderr.flush(); scan_at=now",
     "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
-    " if parts[0]=='tmp' or any(p in blocked for p in parts): return False",
+    " if (parts[0]=='tmp' and len(parts)>1 and parts[1]!='result') or any(p in blocked for p in parts): return False",
     " if any(p.startswith('.simple-sftp-stage-') or '.simple-sftp-partial-' in p for p in parts): return False",
     " if len(parts)>2 and parts[:2]==['experiments','results'] and parts[-1].endswith('.csv.lock'): return False",
     " if parts[0]=='work_dirs' and parts[-1]=='.tb_mean.lock': return False",
@@ -1162,7 +1191,11 @@ function projectInventoryScript() {
     "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink inventory path')",
     "target=os.path.join(root,*parts)",
     "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('inventory path outside project')",
-    "if not os.path.isdir(target) and not os.path.isfile(target): print(json.dumps({'files':{}})); sys.exit(0)",
+    "if not os.path.isdir(root): raise ValueError('INVENTORY_ROOT_UNAVAILABLE')",
+    "try: target_info=os.stat(target,follow_symlinks=False)",
+    "except FileNotFoundError: print(json.dumps({'files':{}})); sys.exit(0)",
+    "if not (statmod.S_ISDIR(target_info.st_mode) or statmod.S_ISREG(target_info.st_mode)): raise ValueError('INVENTORY_TARGET_TYPE')",
+    ...(metadataOnly ? [] : [
     "cache={}; db=None; cache_status='ready'; cache_at=time.monotonic(); update_bytes=0; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
     "try:",
     " cache_dir=os.environ.get('SIMPLE_SFTP_HASH_CACHE_DIR') or os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
@@ -1172,13 +1205,56 @@ function projectInventoryScript() {
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
     " db=None; cache={}; cache_status='unavailable'",
-    "walk=((os.path.dirname(target),[],[os.path.basename(target)]),) if os.path.isfile(target) else os.walk(target,followlinks=False) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
+    ]),
+    "def fail_walk(error): raise error",
+    "def scoped_walk():",
+    " if scopes is None or '.' in scope_set or not recursive: roots=[relroot] if scopes is None or scope_set else []",
+    " else:",
+    "  roots=[]; retained=set()",
+    "  for scope in sorted(scope_set,key=lambda value:(len(value.split('/')),value)):",
+    "   candidate=scope if relroot=='.' or scope.startswith(relroot+'/') else relroot if scope==relroot or relroot.startswith(scope+'/') else None",
+    "   if candidate is None or any('/'.join(candidate.split('/')[:i]) in retained for i in range(1,len(candidate.split('/'))+1)): continue",
+    "   retained.add(candidate); roots.append(candidate)",
+    " for relative in roots:",
+    "  pieces=[] if relative=='.' else relative.split('/')",
+    "  if relative!='.' and not allowed(relative,True): continue",
+    "  cursor=root",
+    "  for piece in pieces:",
+    "   cursor=os.path.join(cursor,piece)",
+    "   if os.path.islink(cursor): raise ValueError('symlink inventory scope: '+relative)",
+    "  if os.path.commonpath((root,os.path.realpath(cursor)))!=root: raise ValueError('inventory scope outside project')",
+    "  try: info=os.stat(cursor,follow_symlinks=False)",
+    "  except FileNotFoundError: continue",
+    "  if statmod.S_ISREG(info.st_mode): yield (os.path.dirname(cursor),[],[os.path.basename(cursor)])",
+    "  elif statmod.S_ISDIR(info.st_mode):",
+    "   if recursive: yield from os.walk(cursor,followlinks=False,onerror=fail_walk)",
+    "   else: yield (cursor,[],[name for name in os.listdir(cursor) if not os.path.isdir(os.path.join(cursor,name))])",
+    "  else: raise ValueError('INVENTORY_SCOPE_TYPE: '+relative)",
+    "walk=scoped_walk()",
     "names=[]",
     "for current,dirs,files in walk:",
-    " if recursive: dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True) and in_scope(os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/'),True)]",
+    " report_scan(1)",
+    ...(metadataOnly ? [" if scan_count>100000: raise ValueError('METADATA_ENTRY_LIMIT')"] : []),
+    " if recursive: dirs[:]=[d for d in dirs if allowed(os.path.relpath(os.path.join(current,d),root),True) and in_scope(os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/'),True) and not os.path.islink(os.path.join(current,d))]",
     " for name in files:",
     "  full=os.path.join(current,name); rel=os.path.relpath(full,root).replace(os.sep,'/')",
     "  if allowed(rel) and in_scope(rel): names.append((rel,full))",
+    "  report_scan(1)",
+    ...(metadataOnly ? ["  if scan_count>100000 or len(names)>50000: raise ValueError('METADATA_ENTRY_LIMIT')"] : []),
+    "report_scan(force=True)",
+    ...(metadataOnly ? [
+    "for rel,full in names:",
+    " try:",
+    "  physical=os.path.realpath(full)",
+    "  if physical!=os.path.abspath(full) or os.path.commonpath((root,physical))!=root: raise ValueError('symlink or escaped metadata path')",
+    "  info=os.lstat(full)",
+    "  if not statmod.S_ISREG(info.st_mode): raise ValueError('metadata target changed type')",
+    "  found[rel]={'size':info.st_size,'modifiedAtMs':info.st_mtime_ns//1000000,'changedAtMs':info.st_ctime_ns//1000000,'device':str(info.st_dev),'inode':str(info.st_ino),'contentRevision':str(info.st_mtime_ns)+':'+str(info.st_ctime_ns)}",
+    " except (OSError,ValueError) as exc: unverified[rel]=type(exc).__name__",
+    " report_scan(1)",
+    "print(json.dumps({'files':found,'unverifiedFiles':unverified,'comparisonBasis':'metadata'},ensure_ascii=False,separators=(',',':')))",
+    "sys.exit(0)",
+    ] : []),
     "if db is not None:",
     " try:",
     "  for offset in range(0,len(names),512):",
@@ -1207,7 +1283,7 @@ function projectInventoryScript() {
     "   try: opened=os.fstat(descriptor)",
     "   finally: os.close(descriptor)",
     "   closed=os.lstat(full)",
-    "   if statmod.S_ISREG(opened.st_mode) and not statmod.S_ISLNK(closed.st_mode) and identity[:4]==cache_identity(opened)[:4] and identity==cache_identity(closed): return (rel,{'sha256':cached[5],'size':stat.st_size,'modifiedAtMs':stat.st_mtime_ns//1000000},None,None)",
+    "   if statmod.S_ISREG(opened.st_mode) and not statmod.S_ISLNK(closed.st_mode) and identity[:4]==cache_identity(opened)[:4] and identity==cache_identity(closed): return (rel,{'sha256':cached[5],'size':closed.st_size,'modifiedAtMs':closed.st_mtime_ns//1000000,'changedAtMs':closed.st_ctime_ns//1000000,'device':str(closed.st_dev),'inode':str(closed.st_ino)},None,None)",
     "  with open(full,'rb') as stream:",
     "   before=os.fstat(stream.fileno()); h=hashlib.sha256()",
     "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk); report_progress(len(chunk))",
@@ -1216,7 +1292,7 @@ function projectInventoryScript() {
     "  if content_identity(stat)!=content_identity(before) or content_identity(before)!=content_identity(after) or content_identity(after)!=content_identity(closed) or cache_identity(stat)[:2]!=cache_identity(before)[:2] or cache_identity(before)[:2]!=cache_identity(after)[:2] or cache_identity(after)[:2]!=cache_identity(closed)[:2] or cache_identity(stat)!=cache_identity(closed):",
     "   return (rel,None,None,'文件校验期间发生变化')",
     "  digest=h.hexdigest()",
-    "  return (rel,{'sha256':digest,'size':closed.st_size,'modifiedAtMs':closed.st_mtime_ns//1000000},(cache_root,rel,*cache_identity(closed),digest),None)",
+    "  return (rel,{'sha256':digest,'size':closed.st_size,'modifiedAtMs':closed.st_mtime_ns//1000000,'changedAtMs':closed.st_ctime_ns//1000000,'device':str(closed.st_dev),'inode':str(closed.st_ino)},(cache_root,rel,*cache_identity(closed),digest),None)",
     " except (FileNotFoundError,PermissionError,OSError) as exc:",
     "  return (rel,None,None,type(exc).__name__)",
     "with ThreadPoolExecutor(max_workers=8) as pool:",
@@ -1255,7 +1331,7 @@ function projectInventoryScript() {
 function projectTreePathAllowed(relative) {
   const parts = String(relative || "").toLowerCase().split("/");
   if (parts.some(part => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) return false;
-  if (parts[0] === "tmp" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
+  if (parts[0] === "tmp" && parts.length > 1 && parts[1] !== "result" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
   if (parts[0] === "experiments" && parts[1] === "results" && parts.at(-1).endsWith(".csv.lock")) return false;
   if (parts[0] === "work_dirs" && parts.at(-1) === ".tb_mean.lock") return false;
   if (parts.at(-1).startsWith(".env")) return false;
@@ -1272,29 +1348,66 @@ async function projectTree(options = {}) {
   const source = directSyncTarget(options.source, "来源");
   const relativePath = String(options.relativePath || ".") === "." ? "." : directSyncRelativePath(options.relativePath);
   if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("远端目录属于机器状态，不可纳入同步范围。");
-  const script = [
-    "import json,os,sys",
+  const output = await (projectTreeTransport || runSsh)(source, `python3 -c ${shellQuote(projectTreeScript())} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
+  const result = JSON.parse(output);
+  if (!Array.isArray(result.entries) || typeof result.exists !== "boolean") throw new Error("远端目录清单无效。");
+  return { ok: true, relativePath, exists: result.exists, entries: result.entries.filter((entry) => projectTreePathAllowed(entry.path)).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name)) };
+}
+
+function projectTreeScript() {
+  return [
+    "import json,os,stat,sys",
     "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]",
     "parts=[] if rel=='.' else rel.split('/')",
     "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe tree path')",
     "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink tree path')",
     "target=os.path.join(root,*parts)",
     "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('tree directory outside project')",
-    "if not os.path.exists(target): print('[]'); sys.exit(0)",
-    "if not os.path.isdir(target): print('[]'); sys.exit(0)",
-    "entries=[]",
+    "if not os.path.isdir(root): raise ValueError('TREE_ROOT_UNAVAILABLE')",
+    "try: info=os.stat(target,follow_symlinks=False)",
+    "except FileNotFoundError: print(json.dumps({'entries':[],'exists':False})); sys.exit(0)",
+    "if not stat.S_ISDIR(info.st_mode): raise ValueError('TREE_TARGET_NOT_DIRECTORY')",
+    "entries=[]; processed=0",
     "for item in os.scandir(target):",
+    " processed+=1",
+    " if processed>50000: raise ValueError('TREE_ENTRY_LIMIT')",
+    " if processed%32==0: print('SIMPLE_PROGRESS '+json.dumps({'phase':'verifying','processedFiles':processed}),file=sys.stderr,flush=True)",
     " if item.is_symlink(): continue",
-    " if not item.is_dir(follow_symlinks=False) and not item.is_file(follow_symlinks=False): continue",
+    " try:",
+    "  directory=item.is_dir(follow_symlinks=False)",
+    "  if not directory and not item.is_file(follow_symlinks=False): continue",
+    "  info=item.stat(follow_symlinks=False)",
+    " except FileNotFoundError: continue",
     " name=item.name; child=name if rel=='.' else rel+'/'+name",
-    " stat=item.stat(follow_symlinks=False)",
-    " entries.append({'name':name,'path':child,'directory':item.is_dir(follow_symlinks=False),'size':stat.st_size if item.is_file(follow_symlinks=False) else None,'modifiedAtMs':stat.st_mtime_ns//1000000})",
-    "print(json.dumps(entries,ensure_ascii=False,separators=(',',':')))",
+    " entries.append({'name':name,'path':child,'directory':directory,'size':None if directory else info.st_size,'modifiedAtMs':info.st_mtime_ns//1000000})",
+    "print(json.dumps({'entries':entries,'exists':True},ensure_ascii=False,separators=(',',':')))",
   ].join("\n");
-  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
-  const entries = JSON.parse(output);
-  if (!Array.isArray(entries)) throw new Error("远端目录清单无效。");
-  return { ok: true, relativePath, entries: entries.filter((entry) => projectTreePathAllowed(entry.path)).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name)) };
+}
+
+function projectTreeStateScript() {
+  return [
+    "import json,os,stat,sys",
+    "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]; parts=[] if rel=='.' else rel.split('/')",
+    "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe tree path')",
+    "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink tree path')",
+    "target=os.path.join(root,*parts)",
+    "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('tree directory outside project')",
+    "if not os.path.isdir(root): raise ValueError('TREE_ROOT_UNAVAILABLE')",
+    "try: info=os.stat(target,follow_symlinks=False)",
+    "except FileNotFoundError: print(json.dumps({'exists':False})); sys.exit(0)",
+    "if not stat.S_ISDIR(info.st_mode): raise ValueError('TREE_TARGET_NOT_DIRECTORY')",
+    "with os.scandir(target) as entries: empty=next(entries,None) is None",
+    "print(json.dumps({'exists':True,'empty':empty}))",
+  ].join("\n");
+}
+async function projectTreeState(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const relativePath = String(options.relativePath || ".") === "." ? "." : directSyncRelativePath(options.relativePath);
+  if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("目录属于机器状态。");
+  const output = await (projectTreeTransport || runSsh)(source, `python3 -c ${shellQuote(projectTreeStateScript())} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
+  const result = JSON.parse(output);
+  if (typeof result.exists !== "boolean" || result.exists && typeof result.empty !== "boolean") throw new Error("目录状态无效。");
+  return { ok: true, relativePath, ...result };
 }
 
 function remoteBatchStage(command) {
@@ -1628,6 +1741,25 @@ async function syncServerToServerBatch(options = {}) {
 
 // Streaming archives never buffer the batch; the byte limit bounds retry/staging cost.
 const FPSYNC_MAX_BATCH_BYTES = 512 * 1024 * 1024;
+
+// 对外能力表与清理守卫的只读身份判定共用同一份声明：只读方法只能在这里显式声明，
+// 守卫不会因为方法名看起来像只读就放行；没有声明的方法一律按可能写入计忙（fail closed）。
+const API_METHOD_CAPABILITIES = {
+      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, controlStrategy: "assigned_tmux_window", noPidSignals: true, runtimeHashProof: true, inspectZeroWrites: true, schedulerRuntimeEvidence: 1, localTunnelRequired: false, activeTasksBlockRestart: false, restartPreservesTasks: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: false, preservesState: true } },
+      "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
+      "files.cleanup.observeBatch": { readOnly: true, zeroWrites: true, maxTargets: 5000, batchCleanupObservation: 1, readConcurrency: [1, 2] },
+      "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
+      "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
+      "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
+      "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
+      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1 },
+      "sync.projectInventory": { scopeTransport: "stdin",
+        readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
+      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
+    };
+
 const FPSYNC_PARALLEL_STREAMS = 2;
 
 function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4, fileSizes, maxBytes = Infinity) {
@@ -3257,7 +3389,7 @@ function listRemoteFiles(sftp, remotePath) {
         return { name: String(name || "").trim(), sizeBytes: Number(sizeText) || 0 };
       }).filter((item) => item.name));
     });
-    const monitor = watchTransferProcess(child, reject, false);
+    const monitor = watchTransferProcess(child, reject, true);
     child.stdout?.on("data", monitor.receive);
   });
 }
@@ -3281,7 +3413,7 @@ function listRemoteDirs(sftp, remotePath) {
         } catch (error) { reject(error); }
       } else resolve(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
     });
-    const monitor = watchTransferProcess(child, reject, false);
+    const monitor = watchTransferProcess(child, reject, true);
     child.stdout?.on("data", monitor.receive);
   });
 }
@@ -3505,7 +3637,7 @@ function nextTransferId(operation) {
   return `transfer-${Date.now()}-${transferSequence}-${String(operation || "").replace(/[^\w.-]+/g, "-")}`;
 }
 
-function createTransferController({ id, operation, localPath, remotePath, host }) {
+function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true, readObserver = false, remoteMutation = false }) {
   const listeners = new Set();
   const progressListeners = new Set();
   let cancelled = false;
@@ -3525,6 +3657,20 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     lastProgressAt: new Date().toISOString(),
     startedAt: new Date().toISOString(),
     status: "running",
+    setCapacityState(state) {
+      const at = new Date().toISOString();
+      controller.capacityState = state;
+      if (state === "queued") controller.capacityQueuedAt = at;
+      else {
+        controller.capacityGrantedAt = at;
+        controller.capacityWaitMs = Date.parse(at) - Date.parse(controller.capacityQueuedAt || at);
+      }
+      localApiServer?.publish({ type: "transfer_progress", data: { id, operationId: controller.operationId,
+        phase: controller.phase, status: controller.status, capacityState: state,
+        capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt, capacityWaitMs: controller.capacityWaitMs } });
+    },
+    observeOnlyIdle,
+    stalled: false,
     totalBytes: 0,
     transferredBytes: 0,
     onCancel(listener) {
@@ -3562,13 +3708,23 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       void maybeSettleTransferOperation(controller.operationId);
     },
   };
-  const idle = new ProgressInactivity(120000, () => controller.cancel(`文件步骤（${controller.phase}）120 秒无真实进展，已取消。请检查该阶段日志和目标状态后重试。`));
+  controller.markStalled = () => {
+    if (disposed || cancelled || controller.stalled) return;
+    controller.stalled = true;
+    const snapshot = { id, operationId: controller.operationId, phase: controller.phase, status: "running", stalled: true,
+      writtenBytes: controller.writtenBytes, writtenFiles: controller.writtenFiles, totalBytes: controller.totalBytes, totalFiles: controller.totalFiles };
+    localApiServer?.publish({ type: "transfer_progress", data: snapshot });
+    for (const listener of progressListeners) { try { listener(snapshot); } catch {} }
+    parentController?.markStalled?.();
+  };
+  const idle = new ProgressInactivity(120000, () => observeOnlyIdle ? controller.markStalled() : controller.cancel(`文件步骤（${controller.phase}）120 秒无真实进展，已取消。请检查该阶段日志和目标状态后重试。`), Date.now, observeOnlyIdle);
   let transferredBytes = 0;
   const wireScopes = new Map();
   let lastEventAt = 0;
   Object.defineProperty(controller, "transferredBytes", { enumerable: true, get: () => transferredBytes, set: (value) => { if (disposed || cancelled) return; transferredBytes = Math.max(transferredBytes, Number(value) || 0); controller.updateProgress({ processedBytes: transferredBytes, phase: "transferring" }); } });
   controller.updateProgress = (evidence) => {
     if (disposed || cancelled || !idle.update(evidence)) return false;
+    controller.stalled = false;
     const phaseChanged = Boolean(evidence.phase && evidence.phase !== controller.phase);
     if (evidence.metric === "wire") {
       const scope = String(evidence.scope || id), count = Math.max(0, Number(evidence.processedBytes) || 0);
@@ -3583,7 +3739,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     if (evidence.processedFiles !== undefined) controller.processedFiles = evidence.processedFiles;
     for (const key of ["cacheHits", "cacheRehash"]) controller[key] = Number.isSafeInteger(evidence[key]) && evidence[key] >= 0 ? evidence[key] : undefined;
     controller.cacheStatus = ["ready", "unavailable", "read-failed", "write-failed"].includes(evidence.cacheStatus) ? evidence.cacheStatus : undefined;
-    for (const key of ["completedFiles", "totalFiles", "completedGroups", "totalGroups"]) {
+    for (const key of ["completedFiles", "totalFiles", "completedGroups", "totalGroups", "totalBytes", "writtenBytes", "writtenFiles"]) {
       if (Number.isSafeInteger(evidence[key]) && evidence[key] >= 0)
         controller[key] = Math.max(controller[key] || 0, evidence[key]);
     }
@@ -3597,6 +3753,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
         progressScope: controller.progressScope, processedFiles: controller.processedFiles,
         completedFiles: controller.completedFiles, totalFiles: controller.totalFiles,
         completedGroups: controller.completedGroups, totalGroups: controller.totalGroups,
+        writtenBytes: controller.writtenBytes, writtenFiles: controller.writtenFiles, stalled: controller.stalled,
         lastProgressAt: controller.lastProgressAt, status: controller.status };
       localApiServer?.publish({ type: "transfer_progress", data: snapshot });
       for (const listener of progressListeners) { try { listener(snapshot); } catch {} }
@@ -3606,13 +3763,16 @@ function createTransferController({ id, operation, localPath, remotePath, host }
   };
   const parentController = transferContext.getStore();
   const parentCancellation = parentController?.onCancel((reason) => controller.cancel(reason));
+  // 只读观测身份在注册那一刻随控制器一起固定；未显式证明的控制器一律按可能写入处理。
+  controller.readObserver = readObserver === true;
+  controller.remoteMutation = remoteMutation === true;
   activeTransfers.set(controller.id, controller);
   if (parentController?.status === "cancelled") controller.cancel("上层操作已取消");
   return controller;
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups, missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups, missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus, writtenBytes, writtenFiles, stalled, capacityState, capacityQueuedAt, capacityGrantedAt, capacityWaitMs, processStartedAt, firstProgressAt }) => ({
     id,
     operation,
     localPath,
@@ -3621,12 +3781,25 @@ function listActiveTransfers() {
     startedAt,
     status,
     totalBytes,
+    writtenBytes, writtenFiles, stalled,
+    capacityState, capacityQueuedAt, capacityGrantedAt, capacityWaitMs, processStartedAt, firstProgressAt,
     transferredBytes,
     operationId, phase, processedFiles, lastProgressAt,
     processedBytes, progressScope, comparedFiles, changedFiles,
     completedFiles, totalFiles, completedGroups, totalGroups,
     missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus,
   }));
+}
+
+/** 守卫与只读 transfers.list 的唯一忙投影入口：同步、纯内存，不加租约、不碰远端、不写状态。
+ *  活跃条件与 0.2.102 逐项等价（非终态传输 / 上传操作 / 保存时上传排队队列），未知状态继续按忙处理。 */
+function currentTransferBusySnapshot(observedAt = new Date().toISOString(), selfController = null) {
+  return transferBusySnapshot({
+    self: selfController,
+    transfers: [...activeTransfers.values()],
+    uploadOperations: [...activeUploadOperations.values()],
+    uploadQueueKeys: [...uploadQueues.keys()],
+  }, { observedAt, instanceId: currentTransferApiInstanceId() });
 }
 
 function currentTransferApiInstanceId() {
@@ -3964,14 +4137,15 @@ function uploadProgressCancellable(options = {}) {
 function runUploadWithProgress(options, title, operation) {
   if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
   const execute = async (progress, token) => {
-    const controller = createTransferController({ id: nextTransferId(title), operation: title, localPath: options.localPath || "", remotePath: options.sftp?.remotePath || "", host: options.sftp?.host || "" });
+    const controller = createTransferController({ id: nextTransferId(title), operation: title, localPath: options.localPath || "", remotePath: options.sftp?.remotePath || "", host: options.sftp?.host || "", observeOnlyIdle: true });
     controller.operationId = options._operationId || transferContext.getStore()?.operationId || controller.id;
+    const stalled = controller.onProgress?.(snapshot => { if (snapshot.stalled) progress?.report?.({ message: "暂未观察到新增写入，仍在查询实际文件；可手动取消" }); });
     const cancellation = token?.onCancellationRequested?.(() => controller.cancel("用户取消"));
     try {
       if (controller.status === "cancelled") throw new Error("传输已取消");
       const result = await transferContext.run(controller, () => operation(token, progress));
       if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认"); return result;
-    } finally { cancellation?.dispose(); controller.dispose(); }
+    } finally { cancellation?.dispose(); stalled?.dispose(); controller.dispose(); }
   };
   if (options.apiMode) return execute({ report() {} }, undefined);
   return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: uploadProgressCancellable(options) }, execute);
@@ -4039,12 +4213,26 @@ function createTransferPreview({ localPath, sftp, operation, detail }) {
   };
 }
 
+async function agentLifecycle(options = {}) {
+  const protocol = require("./agent-lifecycle.js");
+  const payload = protocol.agentPayload(options);
+  const sftp = apiTransferSftp(options);
+  if (!sftp.host) throw new Error("AGENT_TRANSPORT_REQUIRED");
+  if (payload.action !== "inspect" && (options.confirm !== true || options.pathConfirmed !== true))
+    throw confirmationRequired({ method: "agents.lifecycle", target: { host: sftp.host, port: sftp.port, user: sftp.username },
+      payload: { ...payload, agentToken: undefined }, requires: ["confirm", "pathConfirmed"] });
+  return protocol.runAgentRemote(getSshArgs(sftp, protocol.agentRemoteCommand()), payload,
+    (_file, _args, options) => spawnSsh(sftp, protocol.agentRemoteCommand(), options));
+}
+
 function createLocalApiMethods() {
   const methods = {
+    "agents.lifecycle": params => agentLifecycle(params),
     "files.cleanup.check": params => cleanupFileApi.check(params),
     "files.cleanup.verify": params => cleanupFileApi.verify(params),
     "files.cleanup.settle": params => cleanupFileApi.settle(params),
     "files.cleanup.inspect": params => cleanupFileApi.inspect(params),
+    "files.cleanup.observeBatch": params => cleanupFileApi.observeBatch(params),
     "files.cleanup.preview": params => cleanupFileApi.preview(params),
     "files.cleanup.confirm": params => cleanupFileApi.confirm(params),
     "files.cleanup.execute": params => cleanupFileApi.execute(params),
@@ -4361,6 +4549,7 @@ function createLocalApiMethods() {
     "sync.projectInventory": async (params = {}) => projectInventory(params),
     "sync.projectFileStats": async (params = {}) => projectFileStats(params),
     "sync.projectTree": async (params = {}) => projectTree(params),
+    "sync.projectTreeState": async (params = {}) => projectTreeState(params),
     "sync.deletePath": async (params = {}) => deleteProjectPath(params),
     "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch({ ...params, apiMode: true }),
     "sync.serverToServerFpsync": async (params = {}) => syncServerToServerFpsync({ ...params, apiMode: true }),
@@ -4375,7 +4564,9 @@ function createLocalApiMethods() {
     },
     "transfers.list": async () => {
       const operationState = await listTransferOperationState();
-      return { ok: true, instanceId: operationState.instanceId, transfers: listActiveTransfers(), operations: operationState.operations, settledOperations: operationState.settledOperations };
+      // 仍是只读路由：只在内存上算一次守卫同款投影，不加租约、不连远端、不写队列。
+      return { ok: true, instanceId: operationState.instanceId, transfers: listActiveTransfers(), operations: operationState.operations,
+        settledOperations: operationState.settledOperations, busy: currentTransferBusySnapshot() };
     },
     "transfers.reconcile": async (params = {}) => reconcileTransferOperation(params),
     "transfers.cancel": async (params = {}) => {
@@ -4508,36 +4699,71 @@ function createLocalApiMethods() {
     },
   };
   for (const [name, method] of Object.entries(methods)) {
-    if (!/^(sync[.]|upload[.]|download[.]|remote[.])/.test(name)) continue;
+    if (!/^(sync[.]|upload[.]|download[.]|remote[.]|files[.]cleanup[.])/.test(name)) continue;
     methods[name] = async (params = {}) => {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
       const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
       const recoveryContext = name === "sync.serverToServerFpsync" || name === "upload.files" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
         ? { method: name, params: retryIdentity(params) } : undefined;
+      // Metadata is a cancellable read, never a durable modifying transaction.
+      // Stale receipts cannot lock a fresh file-tree refresh.
+      const cleanupRequest = name.startsWith("files.cleanup.");
+      // downloadMappedPaths reads the server but writes local destinations.
+      // It needs writer settlement/cancellation receipts, unlike pure metadata.
+      const metadataRead = (READ_ONLY_SETTLEMENT_METHODS.includes(name) && (name !== "sync.downloadMappedPaths" || params.memoryOnly === true))
+        || ["sync.projectTreeState", "sync.planLogPaths", "remote.listDirs"].includes(name) || cleanupRequest;
       const requestKey = params._requestKey || transferRequestKey(name, params);
-      try {
-        await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, requestKey, recoveryContext);
-      } catch (error) {
-        // A new, explicitly confirmed request may obtain an authoritative exit
-        // receipt for its exact old blocker. Never replay the old upload or unlock
-        // by child count, elapsed time, SSH 255, or a failed probe.
-        if (name !== "upload.files" || params.confirm !== true || params.pathConfirmed !== true || !error?.apiData?.blockedOperationId) throw error;
-        const recovered = await reconcileTransferOperation({ operationId: error.apiData.blockedOperationId,
-          operationInstanceId: error.apiData.operationInstanceId, requestKey, retryMethod: name, retryParams: params });
-        if (!recovered.settled) { error.apiData.reconciliation = recovered; throw error; }
-        await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, requestKey, recoveryContext);
+      if (!metadataRead) {
+        try {
+          await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, requestKey, recoveryContext);
+        } catch (error) {
+          // A new, explicitly confirmed request may obtain an authoritative exit
+          // receipt for its exact old blocker. Never replay the old upload or unlock
+          // by child count, elapsed time, SSH 255, or a failed probe.
+          if (name !== "upload.files" || params.confirm !== true || params.pathConfirmed !== true || !error?.apiData?.blockedOperationId) throw error;
+          const recovered = await reconcileTransferOperation({ operationId: error.apiData.blockedOperationId,
+            operationInstanceId: error.apiData.operationInstanceId, requestKey, retryMethod: name, retryParams: params });
+          if (!recovered.settled) { error.apiData.reconciliation = recovered; throw error; }
+          await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, requestKey, recoveryContext);
+        }
       }
-      const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
+      // 只读身份只能由生产事实成立：本次路由不进入持久写事务（metadataRead）、不是远端变更方法，
+      // 且对外能力表显式声明它只读。任一条件缺失就按普通（可能写入）传输计忙。
+      const readObserver = metadataRead === true && remoteMutation === false
+        && Boolean(API_METHOD_CAPABILITIES[name]) && API_METHOD_CAPABILITIES[name].readOnly === true;
+      const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "",
+        // No file operation is failed or killed because a filesystem call is slow.
+        // Errors and explicit cancellation still settle through the original path.
+        observeOnlyIdle: true, readObserver, remoteMutation });
       controller.operationId = operationId;
+      const requestContext = currentApiRequestContext();
+      const readSignal = requestContext?.readOnly ? requestContext.signal : undefined;
+      const cancelRead = () => controller.cancel("API_READ_CANCELLED");
+      readSignal?.addEventListener("abort", cancelRead, { once: true });
+      if (readSignal?.aborted) cancelRead();
       try {
         if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
-        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params)));
+        const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
+          && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
+        const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
+        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch"].includes(name);
+        const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
+        const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
+          : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
+        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => apiRouteController.run(controller, () => method(params)), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
+        if (name === "sync.projectInventory" || memoryRead) return { ...result, queryTiming: {
+          capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt,
+          capacityWaitMs: controller.capacityWaitMs, processStartedAt: controller.processStartedAt,
+          firstProgressAt: controller.firstProgressAt, completedAt: new Date().toISOString(),
+          lane: metadataInventory ? "metadata-inventory" : memoryRead ? "memory-results" : codeInventory ? "code-sync" : "bulk",
+        } };
         return result;
       } finally {
+        readSignal?.removeEventListener("abort", cancelRead);
         controller.dispose();
-        await finishTransferOperation(operationId);
+        if (!metadataRead) await finishTransferOperation(operationId);
       }
     };
   }
@@ -4842,19 +5068,25 @@ function getRemoteMarkerPath(remotePath, markerName) {
 
 function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], remoteMutation, options = {}) {
   const parent = transferContext.getStore();
+  if (parent) parent.processStartedAt ||= new Date().toISOString();
   const apiContext = currentApiRequestContext();
   trackTransferResource(child, parent?.operationId, apiContext?.readOnly ? false : remoteMutation);
   let buffer = "", bytes = 0, wireBytes = 0;
   const allowed = new Set(filenames), completed = new Set();
-  const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => { child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。")); });
+  const observeOnlyIdle = fileStep || Boolean(parent?.observeOnlyIdle);
+  const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => {
+    if (observeOnlyIdle) { parent?.markStalled(); return; }
+    child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。"));
+  }, Date.now, observeOnlyIdle);
   const cancellation = parent?.onCancel((reason) => { child.kill(); idle.dispose(); onIdle(new Error(reason)); });
-  const cancelledRead = () => { child.kill(); idle.dispose(); onIdle(apiContext.signal.reason); };
+  const cancelledRead = () => { if (parent?.status === "cancelled") return; child.kill(); idle.dispose(); onIdle(apiContext.signal.reason); };
   if (apiContext?.readOnly) {
     apiContext.signal.addEventListener("abort", cancelledRead, { once: true });
     if (apiContext.signal.aborted) cancelledRead();
   }
   if (parent?.status === "cancelled") { child.kill(); idle.dispose(); throw new Error("传输已取消"); }
   const update = (evidence) => {
+    if (parent) parent.firstProgressAt ||= new Date().toISOString();
     evidence = { ...evidence, scope: String(evidence.metric === "wire" && options.wireScope || child.pid || child) };
     idle.update(evidence);
     parent?.updateProgress(evidence);
@@ -4894,6 +5126,41 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
   return { dispose: () => idle.dispose(), receive, update };
 }
 
+const remoteRuntimePrograms = new Set();
+const remoteRuntimeIdentities = new Map();
+async function ensureRemoteRuntimeProgram(source, runtime) {
+  // One bounded installer transaction per node and engine version: content
+  // addressed exclusive install/verification inside the managed program area.
+  // When a root identity is already known it travels in the request and the
+  // installer must observe the same verified root; the first install verifies
+  // the real selected root and binds the returned identity to this exact
+  // node/root/version key. Missing identity is never a license for any path.
+  const prepareOnce = async () => {
+    const output = await runRemoteBatchSsh(source, remoteRuntimePrepareCommand(shellQuote), [JSON.stringify(runtime.request)], 60000,
+      { remoteMutation: true, stage: "清理程序准备" });
+    let result = null;
+    try { result = JSON.parse(String(output)); } catch { result = null; }
+    if (!result?.ok || !["installed", "verified"].includes(result.state)
+      || result.runtimeSha256 !== runtime.sha256 || result.programRelativePath !== runtime.programRelativePath
+      || !result.rootIdentity || typeof result.rootIdentity.path !== "string") {
+      cleanupFail(result?.error?.code || "RUNTIME_PROGRAM_PREPARE_FAILED", result?.error?.message, result?.error || {});
+    }
+    if (runtime.request.rootIdentity && JSON.stringify(result.rootIdentity) !== JSON.stringify(runtime.request.rootIdentity)) cleanupFail("ROOT_IDENTITY_CHANGED");
+    remoteRuntimeIdentities.set(runtime.cacheKey, result.rootIdentity);
+    remoteRuntimePrograms.add(runtime.cacheKey);
+  };
+  try {
+    await prepareOnce();
+  } catch (error) {
+    if (String(error?.code || "") !== "ROOT_IDENTITY_CHANGED" || !runtime.request.rootIdentity) throw error;
+    // The root itself was recreated since the last session: rebind exactly once
+    // against the freshly verified root; never install against an unverified path.
+    remoteRuntimeIdentities.delete(runtime.cacheKey);
+    delete runtime.request.rootIdentity;
+    await prepareOnce();
+  }
+}
+
 async function cleanupFileTransport(request) {
   const node = request.node;
   let output;
@@ -4903,26 +5170,40 @@ async function cleanupFileTransport(request) {
     output = await new Promise((resolve, reject) => {
       const child = spawn(process.platform === "win32" ? "python" : "python3", ["-B", "-X", "utf8", path.join(__dirname, "cleanup-files.py")], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
       let text = "";
-      const timer = setTimeout(() => { child.kill(); reject(new Error("LOCAL_CLEANUP_TIMEOUT")); }, 60000);
+      const monitor = watchTransferProcess(child, reject, true, [], !["inspect", "check", "batch-inspect", "batch-verify"].includes(request.action));
       child.stdout.on("data", chunk => { text += chunk.toString("utf8"); if (text.length > 16 * 1024 * 1024) { child.kill(); reject(new Error("INVENTORY_LIMIT")); } });
-      child.on("error", error => { clearTimeout(timer); reject(error); });
-      child.on("close", code => { clearTimeout(timer); code === 0 ? resolve(text) : reject(new Error("LOCAL_CLEANUP_FAILED")); });
+      child.on("error", error => { monitor.dispose(); reject(error); });
+      child.on("close", code => { monitor.dispose(); code === 0 ? resolve(text) : reject(new Error("LOCAL_CLEANUP_FAILED")); });
       child.stdin.on("error", () => {}); child.stdin.end(JSON.stringify(request));
     });
   } else {
     const source = directSyncTarget({ host: node.host, username: node.user, port: node.port, remotePath: node.root }, "清理节点");
-    // Require a current configured identity. Disabled/history nodes remain available in the profile store.
-    const known = readSharedServers().servers.some(row => {
-      try {
-        const target = apiTransferSftp({ server: row });
-        return target.host === source.host && target.username === source.username && target.port === source.port
-          && String(target.remotePath).replace(/\/+$/, "") === source.remotePath;
-      } catch { return false; }
-    });
-    if (!known) cleanupFail("SERVER_IDENTITY_UNVERIFIED");
-    const loader = "import base64;exec(compile(base64.b64decode(" + JSON.stringify(Buffer.from(script, "utf8").toString("base64")) + "),'simple_sftp_cleanup','exec'))";
-    output = await runRemoteBatchSsh(source, `python3 -B -c ${shellQuote(loader)}`, [JSON.stringify(request)], 60000,
-      { remoteMutation: !["check", "inspect", "inventory", "verify"].includes(request.action), stage: "PLAN 安全文件操作" });
+    // The frozen, fully specified node is the authority for this exact operation.
+    // Never merge an active profile or require a second spelling of an SSH alias.
+    // SSH authentication and canonical root/parent checks still apply.
+    // The engine executes only as the pinned program in the managed program
+    // area; requests cross as bounded stdin, never as an argv source copy.
+    if (!path.isAbsolute(node.root)) cleanupFail("UNSAFE_ROOT");
+    const runtime = runtimePrepareRequest({ root: node.root, source: script });
+    runtime.cacheKey = `${node.host}|${node.port ?? 22}|${node.user ?? ""}|${node.root}|${runtime.sha256}`;
+    const knownIdentity = remoteRuntimeIdentities.get(runtime.cacheKey);
+    if (knownIdentity) runtime.request.rootIdentity = knownIdentity;
+    const programPath = node.root.replace(/\/+$/, "") + "/" + runtime.programRelativePath;
+    const command = remoteRuntimeCommand(programPath, shellQuote);
+    const options = { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe", "batch-inspect", "batch-verify"].includes(request.action), stage: "PLAN 安全文件操作" };
+    const missingProgram = error => /can't open file|No such file or directory|RUNTIME_PROGRAM_MISSING|RUNTIME_CODE_MISMATCH/i.test(String(error?.stderr || "") + String(error?.message || ""));
+    if (!remoteRuntimePrograms.has(runtime.cacheKey)) await ensureRemoteRuntimeProgram(source, runtime);
+    try {
+      output = await runRemoteBatchSsh(source, command, [JSON.stringify(request)], 60000, options);
+    } catch (error) {
+      if (!missingProgram(error)) throw error;
+      // A removed or mutated pinned program is reinstalled for this exact
+      // version once and the same request retries once; there is no older
+      // source-argv channel to fall back to.
+      remoteRuntimePrograms.delete(runtime.cacheKey);
+      await ensureRemoteRuntimeProgram(source, runtime);
+      output = await runRemoteBatchSsh(source, command, [JSON.stringify(request)], 60000, options);
+    }
   }
   return JSON.parse(String(output));
 }
@@ -4942,7 +5223,7 @@ function runSsh(sftp, command, timeout) {
       }
       resolve(stdout);
     });
-    const monitor = watchTransferProcess(child, reject, Boolean(transferContext.getStore()), [], undefined, { stdoutBytesArePayload: false });
+    const monitor = watchTransferProcess(child, reject, true, [], undefined, { stdoutBytesArePayload: false });
     child.stdout?.on("data", monitor.receive);
   });
 }
@@ -5317,6 +5598,17 @@ async function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, t
   const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath, process.platform)).join("\n")}\n`;
   const chunkedChecksum = hashUploadPlanChunks(plan.files);
   const startedAt = Date.now();
+  const parent = transferContext.getStore();
+  const observer = startRemoteFileProgress({ source: sftp, files: plan.files,
+    launch: (_file, args, options) => spawnSsh(sftp, args[args.length - 1], options), sshArgs: getSshArgs, quote: shellQuote,
+    onProgress: value => {
+      parent?.updateProgress({ phase: "transferring", scope: "remote-files", processedBytes: value.writtenBytes, processedFiles: value.writtenFiles, ...value });
+      progress?.report?.({ message: `远端已写入 ${value.writtenBytes}/${value.totalBytes} 字节，${value.writtenFiles}/${value.totalFiles} 个文件；内容待核验` });
+    }, onError: () => progress?.report?.({ message: "远端文件进度暂时无法查询，传输完成后仍会校验内容" }) });
+  trackTransferResource(observer.child, parent?.operationId, false);
+  const observerCancellation = parent?.onCancel(() => observer.stop());
+  await observer.ready;
+  if (parent?.status === "cancelled") { observer.stop(); observerCancellation?.dispose(); throw new Error("用户已取消本次上传"); }
   const upload = new Promise((resolve, reject) => {
     const controller = createTransferController({
       id: transferId || nextTransferId(operation),
@@ -5324,6 +5616,7 @@ async function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, t
       localPath,
       remotePath: String(sftp && sftp.remotePath || ""),
       host: String(sftp && sftp.host || ""),
+      observeOnlyIdle: true,
     });
     controller.totalBytes = plan.byteCount;
     let reportedPercent = 0;
@@ -5437,6 +5730,7 @@ async function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, t
     });
 
   return upload.finally(() => {
+    observer.stop(); observerCancellation?.dispose();
   });
 }
 
@@ -5456,7 +5750,8 @@ async function downloadMappedPaths(options = {}) {
 }
 
 async function downloadMappedPathsCore(options = {}) {
-  return withTransferCapacity(options, () => downloadMappedPathsInternal(options));
+  const memoryRead = options.memoryOnly === true && options.metricsOnly === true;
+  return withTransferCapacity(options, () => downloadMappedPathsInternal(options), memoryRead ? memoryResultCapacity : transferCapacity);
 }
 
 async function downloadMappedPathsInternal(options = {}) {
@@ -5614,6 +5909,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
     localPath: String(localPath || ""),
     remotePath: String(sftp.remotePath || ""),
     host: String(sftp.host || ""),
+    observeOnlyIdle: true,
   });
   controller.totalBytes = plan.byteCount || 0;
   const launch = spawnImpl || spawn;
@@ -6176,6 +6472,7 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
     const controller = createTransferController({
       id: transferId || nextTransferId("远端到本地同步"),
       operation: "远端到本地同步",
+      observeOnlyIdle: true,
       localPath,
       remotePath: String(sftp && sftp.remotePath || ""),
       host: String(sftp && sftp.host || ""),
@@ -6564,7 +6861,11 @@ async function ensureMacTransferAuthentication(target, role, wholeRequestNotStar
       { remoteMutation: false, stage: `${role}认证` });
     if (result !== "SIMPLE_SFTP_AUTH_READY") throw new Error("认证回执无效");
   } catch (error) {
-    const failure = new Error(`${role} SSH 认证未完成（${target.username || target.user || ""}@${target.host}:${target.port || 22}）：${String(error?.message || error)}`);
+    // Keep the common SSH error code, recovery data and execution boundary:
+    // the message prefix explains the failure, while code/apiData keep the
+    // not-started boundary honest and exitCode keeps the common SSH category.
+    const failure = error instanceof Error ? error : new Error(String(error));
+    failure.message = `${role} SSH 认证未完成（${target.username || target.user || ""}@${target.host}:${target.port || 22}）：${failure.message}`;
     failure.code = "SSH_AUTHENTICATION_NOT_READY";
     failure.apiData = { ...(wholeRequestNotStarted ? { notStarted: true } : {}), currentBatchNotStarted: true, phase: "authentication", role };
     failure.exitCode = error?.exitCode;
@@ -6699,6 +7000,7 @@ async function deactivate() {
   };
   await boundedWait(Promise.all([...activeTransferResources.keys()].map(waitLocalTransferResources)));
   await boundedWait(persistTransferOperationLedger());
+  if (tunnelAuthBridge) { await tunnelAuthBridge.dispose(); tunnelAuthBridge = undefined; }
   if (macAuthentication) { await macAuthentication.dispose(); macAuthentication = undefined; }
   if (localApiServer) {
     await localApiServer.dispose().catch(() => undefined);
@@ -6714,7 +7016,7 @@ function waitLocalTransferResources(operationId) {
   })));
 }
 
-async function withTransferCapacity(options, work) {
+async function withTransferCapacity(options, work, pool = transferCapacity) {
   if (!transferContext.getStore()) require("./mac-update-gate").assertBusinessAllowed();
   const parent = transferContext.getStore();
   const abort = new AbortController();
@@ -6728,8 +7030,10 @@ async function withTransferCapacity(options, work) {
   if (readSignal?.aborted) cancelRead();
   const keys = [options.source, options.destination, options.server, options.sftp, options.target, options].filter(item => item?.host).map(item => String(item.host).toLowerCase() + ":" + normalizeSshPort(item.port, 22));
   parent?.pause();
+  parent?.setCapacityState?.("queued");
   try {
-    return await transferCapacity.run(keys, abort.signal, async () => {
+    return await pool.run(keys, abort.signal, async () => {
+      parent?.setCapacityState?.("running");
       parent?.resume();
       try { return await work(); }
       finally { if (parent?.operationId) await waitLocalTransferResources(parent.operationId); }
@@ -6755,6 +7059,8 @@ module.exports = {
     spawnSsh,
     getSshArgs,
     setMacAuthentication: value => { macAuthentication = value; },
+    setTunnelAuthBridge: value => { tunnelAuthBridge = value; },
+    getTunnelAuthBridge: () => tunnelAuthBridge,
     ensureMacTransferAuthentication,
     runLocalTarUploadCore,
     addTarExcludePattern,
@@ -6801,6 +7107,9 @@ module.exports = {
     fpsyncProgressTitle,
     planLogPathsFromState,
     projectInventoryScript,
+    projectTreeScript,
+    projectTreeStateScript,
+    setProjectTreeTransport: value => { projectTreeTransport = value; },
     projectTreePathAllowed,
     normalizeDownloadScope,
     normalizeDownloadScopePath,
@@ -6814,6 +7123,7 @@ module.exports = {
     createTransferController,
     createLocalApiMethods,
     setTransferSettlementTestContext(options = {}) {
+      if (Object.hasOwn(options, "cleanupApi")) cleanupFileApi = options.cleanupApi;
       transferRecoveryTestHooks = options.recoveryHooks || null;
       transferRecoveries.clear();
       extensionContext = { globalState: options.globalState };
@@ -6839,6 +7149,7 @@ module.exports = {
     classifyTransportFailure,
     isRememberedTransferPath,
     listActiveTransfers,
+    currentTransferBusySnapshot, cleanupActivityGuard,
     refreshConnectTimeoutFromConfig,
     resolveCreateProjectTarget,
     updateWorkspaceTargetCore,

@@ -1,12 +1,12 @@
 "use strict";
 const { AsyncLocalStorage } = require("node:async_hooks");
 class TransferCapacity {
-  constructor() { this.context = new AsyncLocalStorage(); this.active = 0; this.workers = new Map(); this.pending = []; }
+  constructor({ concurrency = 2, maxPending = 64 } = {}) { this.context = new AsyncLocalStorage(); this.active = 0; this.workers = new Map(); this.pending = []; this.concurrency = concurrency; this.maxPending = maxPending; }
   run(keys, signal, work) {
     if (this.context.getStore()) return work();
     const unique = [...new Set(keys.length ? keys : ["unresolved-target"])];
     if (signal?.aborted) return Promise.reject(signal.reason);
-    if (this.pending.length >= 64) return Promise.reject(new Error("TRANSFER_CAPACITY_EXCEEDED"));
+    if (this.pending.length >= this.maxPending) return Promise.reject(new Error("TRANSFER_CAPACITY_EXCEEDED"));
     return new Promise((resolve, reject) => {
       const row = { keys: unique, work, resolve, reject, signal };
       row.abort = () => {
@@ -20,7 +20,7 @@ class TransferCapacity {
     });
   }
   drain() {
-    for (let i = 0; i < this.pending.length && this.active < 2;) {
+    for (let i = 0; i < this.pending.length && this.active < this.concurrency;) {
       const row = this.pending[i];
       if (row.keys.some(key => this.workers.has(key))) { i++; continue; }
       this.pending.splice(i, 1); row.signal?.removeEventListener("abort", row.abort);

@@ -49,11 +49,13 @@ test("corrupt, incomplete, oversized or unavailable native snapshots never estab
   for (const id of ["missing", "0:invalid", "2147483648:invalid"]) await assert.rejects(settlement.localTransferExitProof(id), /UNAVAILABLE/);
 });
 test("Windows keeps native CIM proof and unsupported platforms do not execute a fallback", async () => {
-  const windows = load("win32"); stdout = "[]"; nativeCalls.length = 0;
-  assert.equal((await windows.localTransferExitProof("123:old")).localOwnerExited, true);
+  // Windows 血统证据契约：实例身份必须携带 ISO 启动时间，census 必须包含当前生产者并给出父进程。
+  const windows = load("win32"); const oldId = `123:${new Date("2020-01-01T00:00:00Z").toISOString()}`;
+  stdout = JSON.stringify([{ ProcessId: 111, ParentProcessId: 0, Name: "Code.exe" }]); nativeCalls.length = 0;
+  assert.equal((await windows.localTransferExitProof(oldId)).localOwnerExited, true);
   assert.equal(nativeCalls[0].file, "pwsh.exe"); assert.match(nativeCalls[0].args[3], /Get-CimInstance Win32_Process/);
-  stdout = JSON.stringify([{ ProcessId: 123, Name: "Code.exe" }]);
-  await assert.rejects(windows.localTransferExitProof("123:old"), /STILL_ACTIVE/);
+  stdout = JSON.stringify([{ ProcessId: 111, ParentProcessId: 0, Name: "Code.exe" }, { ProcessId: 123, ParentProcessId: 0, Name: "Code.exe" }]);
+  await assert.rejects(windows.localTransferExitProof(oldId), /STILL_ACTIVE/);
   nativeCalls.length = 0; await assert.rejects(load("linux").localTransferExitProof("123:old"), /UNAVAILABLE/);
   assert.equal(nativeCalls.length, 0); stdout = idle;
 });

@@ -15,8 +15,11 @@ Module._load = function (request, ...args) {
     workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   } : originalLoad.call(this, request, ...args);
 };
+// Linux 门禁无 AppData 写权限：把租约根指到本测试进程的临时目录（仅改环境变量，不改生产代码）。
+process.env.APPDATA = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "simple-sftp-gate-lease-"));
 const { __test } = require("../extension.js");
 Module._load = originalLoad;
+const { createTransferHarness } = require("./_helpers/supportedHostPlatform");
 
 function sha256(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
@@ -30,14 +33,6 @@ function hashesFor(names, overrides = {}) {
   return Object.fromEntries(names.map((name) => [name, overrides[name] || sha256(name)]));
 }
 
-function installTransport(handler) {
-  __test.setRemoteBatchTransport(handler);
-}
-
-test.afterEach(() => {
-  __test.setRemoteBatchTransport(null);
-});
-
 test("first packed group reports before the batch finishes and completion waits for verification", async () => {
   const messages = [];
   const reports = [];
@@ -48,21 +43,25 @@ test("first packed group reports before the batch finishes and completion waits 
   let sawStartBeforeRelease = false;
   let packedStarted;
   const started = new Promise((resolve) => { packedStarted = resolve; });
-  installTransport(async (source, command, paths) => {
-    if (/tar --null -T - -cvf -/.test(command)) {
+  // 隔离夹具：批量打包通道与清单检查均为显式注入替身，进度/校验时序断言全部保留。
+  const { sandbox } = createTransferHarness({
+    platform: "win32",
+    batch: async (_source, command) => {
+      assert.match(command, /tar --null -T - -cvf -/);
       tarCalls += 1;
       if (!sawStartBeforeRelease) sawStartBeforeRelease = messages.some((message) => message.includes("正在流处理（打包、传输与解包）"));
       packedStarted();
       await tarGate;
       return "";
-    }
-    const requested = paths.filter(Boolean);
-    if (source.host === "target-b" && !messages.some((message) => message.includes("正在校验目标 Worker"))) {
-      return JSON.stringify({ files: Object.fromEntries(requested.map((name) => [name, sha256(`old-${name}`)])), cacheHits: 0, cacheRehash: requested.length, digestReads: requested.length, cacheQueries: requested.length });
-    }
-    return JSON.stringify({ files: hashesFor(requested), cacheHits: 0, cacheRehash: requested.length, digestReads: requested.length, cacheQueries: requested.length });
+    },
+    fpsync: { inspect: async (source, requested) => {
+      if (source.host === "target-b" && !messages.some((message) => message.includes("正在校验目标 Worker"))) {
+        return { files: Object.fromEntries(requested.map((name) => [name, sha256(`old-${name}`)])), cacheRehash: requested.length, digestReads: requested.length, cacheQueries: requested.length };
+      }
+      return { files: hashesFor(requested), cacheRehash: requested.length, digestReads: requested.length, cacheQueries: requested.length };
+    } },
   });
-  const pending = __test.syncServerToServerFpsyncCore({
+  const pending = sandbox.syncServerToServerFpsyncCore({
     source: endpoint("source-a"),
     destination: endpoint("target-b"),
     relativePaths: names,
@@ -101,15 +100,15 @@ test("transfer keeps at most two live groups for 33 and 355 files", async () => 
     let live = 0;
     let maxLive = 0;
     const events = [];
-    installTransport(async () => {
+    const { sandbox } = createTransferHarness({ platform: "win32", batch: async () => {
       live += 1;
       maxLive = Math.max(maxLive, live);
       await new Promise((resolve) => setTimeout(resolve, 15));
       live -= 1;
       return "";
-    });
+    } });
     const paths = Array.from({ length: count }, (_, index) => `runs/${index}.log`);
-    const partitions = await __test.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), paths, 1000, (event) => events.push(event));
+    const partitions = await sandbox.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), paths, 1000, (event) => events.push(event));
     const expected = count <= 80 ? 1 : 2;
     assert.equal(partitions, expected);
     assert.ok(maxLive >= 1 && maxLive <= 2);
@@ -123,7 +122,7 @@ test("one group failure settles live streams and skips later groups", async () =
   const paths = Array.from({ length: 200 }, (_, index) => `runs/${index}.log`);
   let started = 0;
   const events = [];
-  installTransport(async () => {
+  const { sandbox } = createTransferHarness({ platform: "win32", batch: async () => {
     const mine = ++started;
     await new Promise((resolve) => setTimeout(resolve, 40));
     if (mine === 1) {
@@ -133,8 +132,8 @@ test("one group failure settles live streams and skips later groups", async () =
       throw error;
     }
     return "";
-  });
-  await assert.rejects(__test.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), paths, 1000, (event) => events.push(event)), /group failed/);
+  } });
+  await assert.rejects(sandbox.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), paths, 1000, (event) => events.push(event)), /group failed/);
   assert.ok(started <= 4);
   assert.equal(events.some((event) => event.phase === "done"), false);
 });
@@ -143,13 +142,13 @@ test("a throwing progress callback rejects after live workers settle", async () 
   const paths = Array.from({ length: 200 }, (_, index) => `runs/${index}.log`);
   let started = 0;
   let finished = 0;
-  installTransport(async () => {
+  const { sandbox } = createTransferHarness({ platform: "win32", batch: async () => {
     started += 1;
     await new Promise((resolve) => setTimeout(resolve, 20));
     finished += 1;
     return "";
-  });
-  await assert.rejects(__test.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), paths, 1000, (event) => {
+  } });
+  await assert.rejects(sandbox.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), paths, 1000, (event) => {
     if (event.phase === "done") throw new Error("progress callback failed");
   }), /progress callback failed/);
   assert.equal(finished, started);
@@ -159,13 +158,16 @@ test("a throwing progress callback rejects after live workers settle", async () 
 test("verification mismatch and persistent checkpoint change do not report success", async () => {
   const names = ["runs/last_checkpoint.pth"];
   const messages = [];
-  installTransport(async (_source, command, paths) => {
-    if (/tar --null/.test(command)) return "";
-    const found = hashesFor(paths);
-    if (messages.some((message) => message.includes("正在校验目标 Worker"))) found[names[0]] = sha256("other-version");
-    return JSON.stringify({ files: found, cacheHits: 0, cacheRehash: paths.length, digestReads: paths.length, cacheQueries: paths.length });
+  const mismatch = createTransferHarness({
+    platform: "win32",
+    batch: async (_source, command) => { assert.match(command, /tar --null/); return ""; },
+    fpsync: { inspect: async (_source, requested) => {
+      const found = hashesFor(Array.from(requested));
+      if (messages.some((message) => message.includes("正在校验目标 Worker"))) found[names[0]] = sha256("other-version");
+      return { files: found, cacheRehash: requested.length, digestReads: requested.length, cacheQueries: requested.length };
+    } },
   });
-  await assert.rejects(__test.syncServerToServerFpsyncCore({
+  await assert.rejects(mismatch.sandbox.syncServerToServerFpsyncCore({
     source: endpoint("source-a"),
     destination: endpoint("target-b"),
     relativePaths: names,
@@ -176,16 +178,17 @@ test("verification mismatch and persistent checkpoint change do not report succe
   assert.equal(messages.some((message) => message.startsWith("完成：")), false);
 
   messages.length = 0;
-  installTransport(async (_source, command) => {
-    if (/python3 -c/.test(command)) {
+  const raced = createTransferHarness({
+    platform: "win32",
+    batch: async () => { throw new Error("tar must not start"); },
+    fpsync: { inspect: async () => {
       const error = new Error("跨 Worker 内容清单失败（退出码 1）：ValueError: file changed during batch sync: runs/last_checkpoint.pth");
       error.exitCode = 1;
       error.stage = "内容清单";
       throw error;
-    }
-    throw new Error("tar must not start");
+    } },
   });
-  await assert.rejects(__test.syncServerToServerFpsyncCore({
+  await assert.rejects(raced.sandbox.syncServerToServerFpsyncCore({
     source: endpoint("source-a"),
     destination: endpoint("target-b"),
     relativePaths: names,
@@ -226,27 +229,17 @@ test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
       kill() {},
     });
   };
-  const extensionPath = require.resolve("../extension.js");
-  delete require.cache[extensionPath];
-  Module._load = function (request, ...args) {
-    return request === "vscode" ? {
-      TreeItem: class {},
-      ProgressLocation: { Notification: 1 },
-      window: { withProgress: (_options, operation) => operation({ report: () => undefined }) },
-      workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
-    } : originalLoad.call(this, request, ...args);
-  };
   try {
-    const fresh = require("../extension.js");
-    await assert.rejects(fresh.__test.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), ["runs/steady.bin"], 0, () => {}), (error) => {
+    // 隔离夹具 realBatch 模式：真实 runRemoteBatchSsh/remoteBatchStage/transferErrorLog 切片，
+    // 子进程由宿主 spawn 替身提供；阶段、stderr 净化与退出码契约断言全部保留。
+    const { sandbox } = createTransferHarness({ platform: "win32", realBatch: true });
+    await assert.rejects(sandbox.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), ["runs/steady.bin"], 0, () => {}), (error) => {
       assert.doesNotMatch(error.message + error.stderr, /SIMPLE_PROGRESS|SIMPLE_CHUNK_VERIFIED|SIMPLE_COMPRESSION_WIRE/);
       assert.ok(error.message.length < 5000);
       return error.exitCode === 23 && error.stage === "压缩打包传输" && /tar: refused/.test(error.stderr) && /压缩打包传输失败（退出码 23）/.test(error.message);
     });
   } finally {
     childProcess.spawn = realSpawn;
-    delete require.cache[extensionPath];
-    Module._load = originalLoad;
   }
 });
 

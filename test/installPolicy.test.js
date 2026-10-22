@@ -6,7 +6,14 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const source = fs.readFileSync(path.join(__dirname, "../scripts/install-latest.ps1"), "utf8");
 
-for (const trailing of [true, false]) test(`install lock preflight accepts a verified temp parent (trailing separator=${trailing})`, () => {
+// 静态策略断言与平台无关，所有门禁都必须执行。
+test("install script never force-breaks locks or deletes recovery state", () => {
+  assert.doesNotMatch(source, /--force|Remove-Item|\.Delete\(/);
+  assert.match(source, /FileShare\]::None/);
+});
+
+// pwsh.exe 仅存在于 Windows 宿主；Linux 门禁跳过真实解释器执行，宿主门禁仍执行。
+for (const trailing of [true, false]) test(`install lock preflight accepts a verified temp parent (trailing separator=${trailing})`, { skip: process.platform !== "win32" ? "需要 Windows pwsh.exe" : false }, () => {
   const assignment = source.split(/\r?\n/).find(line => line.startsWith("$temporaryRoot = "));
   const check = source.split(/\r?\n/).find(line => line.startsWith("if ((Split-Path -Parent $lockPath)"));
   const command = `$ErrorActionPreference='Stop'; $raw=[System.IO.Path]::GetTempPath(); ${trailing ? "" : "$raw=[System.IO.Path]::TrimEndingDirectorySeparator($raw);"} ${assignment.replace("([System.IO.Path]::GetTempPath())", "$raw")}; $lockPath=Join-Path $temporaryRoot 'simple-sftp-install.lock'; ${check}; Write-Output 'verified'`;
