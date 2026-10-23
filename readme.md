@@ -2,7 +2,7 @@
 
 Apple Silicon、macOS26+ 的 VS Code SSH/tar 传输扩展，配套 [SimpleExperiment Mac](https://github.com/zlinkw/SimpleExperiment-Mac)。Windows为业务唯一权威；Mac只适配本机路径、SSH/凭据、应用数据和CLI。
 
-**本配套 preview 的 SimpleSFTP Mac 版本为 0.2.102，满足 ≥0.2.102 共同更新租约协议的最低要求。** 冻结 Windows SFTP **0.2.104 / 13ef630a12c6ea02ad9277452e75dbf443b9a34b**，配套参考 Experiment **0.5.400 / 30626e78ea2f4b8a3e19e2cb09ae6aefcc6deb39**。本版包含批量隔离/快速清理、控制器对象身份忙证据、进度/结算和等待策略，保留 Mac 原生认证、路径、CLI、更新租约及 Darwin 句柄证明；已完成构建、语法/运行闭包、隔离回归及 Windows 专属验证，M5 原生体验尚未实机验证。源码基线见 [对齐说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-alignment-2026-10-22.md)，发行文件以 [preview-v0.5.315](https://github.com/zlinkw/SimpleExperiment-Mac/releases/tag/preview-v0.5.315) 的实际内容为准。
+**本配套 preview 的 SimpleSFTP Mac 版本为 0.2.103，继续兼容 ≥0.2.102 共同更新租约协议。** 冻结 Windows SFTP **0.2.107 / fc962236210ca692397dd58eefbefd0bf108f85a**，配套参考 Experiment **0.5.403 / c30d607f1b63d224e8a65ab94371d86b4dd81c0d**。本版增加机器状态根传递、系统Python解析与精确busy拒绝，保留Mac独立认证、POSIX路径、CLI、更新租约和Darwin句柄证明。两仓483文件2963项通过，M5原生体验未验。源码见 [对齐说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-alignment-2026-10-24.md)，发行以 [preview-v0.5.316](https://github.com/zlinkw/SimpleExperiment-Mac/releases/tag/preview-v0.5.316) 的清单为准。包内根README旧版本文字不影响实际manifest版本；最新说明以在线仓库为准。
 
 ## 安装和更新入口
 
