@@ -1,4 +1,5 @@
 node_modules/
+node_modules
 *.vsix
 *.vsix.writing
 __pycache__/

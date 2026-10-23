@@ -382,7 +382,7 @@ class CleanupFileApi {
         || /[\\\x00\r\n\x00-\x1f:*?[\]{}]/.test(rel) || rel.split("/").some(part => !part || part === "." || part === "..")) fail("INVALID_REQUEST");
       if (rel.split("/").includes(".git")) fail("PROTECTED_PATH");
       const archivedDelete = /^clean_dir\/job-[a-f0-9]{48}\//.test(rel);
-      if (rel.startsWith("clean_dir/") && !archivedDelete) fail("UNSAFE_DESTINATION");
+      if (rel === "clean_dir" || rel.startsWith("clean_dir/") && !archivedDelete) fail("UNSAFE_DESTINATION");
       if (archivedDelete && target.destination !== rel) fail("UNSAFE_DESTINATION");
     }
     const operationId = "cleanup-" + crypto.randomBytes(16).toString("hex");

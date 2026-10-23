@@ -77,7 +77,7 @@ def lifecycle_contract(params):
     root = lifecycle_canonical(params["projectDir"])
     install = lifecycle_canonical(params["installDir"], exists=False)
     namespace = os.path.basename(root) + "." + hashlib.sha256(root.encode()).hexdigest()[:16]
-    state = lifecycle_canonical(os.path.join(install, "state", "projects", namespace), exists=False)
+    state = lifecycle_canonical(params.get("stateDir") or os.path.join(install, "state", "projects", namespace), exists=False)
     mode = params.get("mode")
     worker = str(params.get("workerId") or "")
     if mode != "worker_telemetry" or not worker:
@@ -383,8 +383,9 @@ def lifecycle_service_guard(args, version):
     params = {"projectDir": args.project_dir, "installDir": os.environ.get("SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR") or os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
               "mode": args.mode, "workerId": args.worker_id, "host": args.host, "port": args.port,
               "condaEnv": os.environ.get("SIMPLE_EXPERIMENT_CONDA_ENV", ""), "agentToken": getattr(args, "token", "") or os.environ.get("SIMPLE_EXPERIMENT_AGENT_TOKEN", "")}
-    contract = lifecycle_contract(params)
     alternate_state = getattr(args, "state_dir", "") or os.environ.get("SIMPLE_EXPERIMENT_AGENT_STATE_DIR", "")
+    params["stateDir"] = alternate_state
+    contract = lifecycle_contract(params)
     if alternate_state and lifecycle_canonical(alternate_state, exists=False) != contract["stateDir"]:
         raise AgentLifecycleError("AGENT_STATE_DIR_UNMANAGED")
     lifecycle_check_owner(contract)
@@ -496,9 +497,19 @@ def lifecycle_control(params):
         python = lifecycle_python(contract)
         script = os.path.join(contract["installDir"], "simple_cluster", "runtime", "cluster_agent.py")
         nonce = uuid.uuid4().hex
+        # The Worker machine-state root is part of the launch contract (parent A):
+        # the template carries the SAME resolved authoritative value the collector
+        # and every consumer use (deployment injection wins, else the managed
+        # per-USER anchor), so a template-started Agent never falls back to a
+        # per-project root and never forks a second collector source.
+        worker_state_root = str(params.get("workerStateDir") or os.environ.get("SIMPLE_EXPERIMENT_WORKER_STATE_DIR") or "").strip() \
+            or os.path.join(os.path.expanduser("~"), ".simple-cluster", "worker-state")
+        worker_state_root = lifecycle_canonical(worker_state_root, exists=False)
         env = {"SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR": contract["installDir"], "SIMPLE_EXPERIMENT_CONDA_ENV": contract["condaEnv"],
                "SIMPLE_EXPERIMENT_AGENT_NONCE": nonce, "SIMPLE_EXPERIMENT_REMOTE_TMUX_SESSION_PREFIX": str(params.get("sessionPrefix") or "simple"),
-               "SIMPLE_EXPERIMENT_AGENT_TOKEN": str(params.get("agentToken") or "")}
+               "SIMPLE_EXPERIMENT_AGENT_TOKEN": str(params.get("agentToken") or ""),
+               "SIMPLE_EXPERIMENT_WORKER_STATE_DIR": worker_state_root,
+               "SIMPLE_EXPERIMENT_AGENT_STATE_DIR": contract["stateDir"]}
         # Do not inherit a previous tmux server shell's GPU/container binding.
         # Preserve only this controller's binding in this one Agent command.
         for key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "TMUX_TMPDIR"):
@@ -540,7 +551,5 @@ def lifecycle_main(params=None):
         result = {"ok": False, "code": getattr(error, "code", "AGENT_LIFECYCLE_FAILED"), "error": str(error)}
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0 if result.get("ok") else 1
-
-
 if __name__ == "__main__":
     sys.exit(lifecycle_main())

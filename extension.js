@@ -1745,7 +1745,7 @@ const FPSYNC_MAX_BATCH_BYTES = 512 * 1024 * 1024;
 // 对外能力表与清理守卫的只读身份判定共用同一份声明：只读方法只能在这里显式声明，
 // 守卫不会因为方法名看起来像只读就放行；没有声明的方法一律按可能写入计忙（fail closed）。
 const API_METHOD_CAPABILITIES = {
-      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, controlStrategy: "assigned_tmux_window", noPidSignals: true, runtimeHashProof: true, inspectZeroWrites: true, schedulerRuntimeEvidence: 1, localTunnelRequired: false, activeTasksBlockRestart: false, restartPreservesTasks: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: false, preservesState: true } },
+      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, rootMapping: 1, controlStrategy: "assigned_tmux_window", noPidSignals: true, runtimeHashProof: true, inspectZeroWrites: true, schedulerRuntimeEvidence: 1, localTunnelRequired: false, activeTasksBlockRestart: false, restartPreservesTasks: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: false, preservesState: true } },
       "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
       "files.cleanup.observeBatch": { readOnly: true, zeroWrites: true, maxTargets: 5000, batchCleanupObservation: 1, readConcurrency: [1, 2] },
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
