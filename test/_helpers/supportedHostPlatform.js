@@ -47,7 +47,7 @@ const PROBE_RANGE = rangeSlice("async function negotiateTransferCompression(", "
 const REAL_BATCH_RANGE = rangeSlice("function remoteBatchStage(", "function hashQuiescenceHelpers(");
 const MAPPED_CONSTANTS = rangeSlice("const MAPPED_DOWNLOAD_DEFAULT_MAX_FILE_BYTES", "function assertSafeScopedLocalPaths(");
 const MAPPED_CHAIN = rangeSlice("let mappedDownloadTransport = null;", "function cleanupMappedStagingFiles(");
-const MAPPED_TAIL = ["cleanupMappedStagingFiles", "mappedStagingPath", "openMappedStagingStream", "assertMappedAncestorChain", "createTarByteReader",
+const MAPPED_TAIL = ["cleanupMappedStagingFiles", "mappedStagingDirectory", "mappedStagingPath", "openMappedStagingStream", "assertMappedAncestorChain", "createTarByteReader",
   "requireApiConfirmation", "buildApiConfirmationPreview", "isRememberedTransferPath", "transferPathConfirmationKey",
   "createTransferPreview", "appendProcessOutput", "formatProcessFailure", "getSshArgs", "toPosixPath", "transferTimeoutMs",
   "downloadScopeBlockedPath", "normalizeSshPort", "parseMappedTarHeader", "readTarField", "writeStreamChunk", "closeWriteStream"]

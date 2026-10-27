@@ -2,7 +2,7 @@
 
 Apple Silicon、macOS26+ 的 VS Code SSH/tar 传输扩展，配套 [SimpleExperiment Mac](https://github.com/zlinkw/SimpleExperiment-Mac)。Windows为业务唯一权威；Mac只适配本机路径、SSH/凭据、应用数据和CLI。
 
-**本配套 preview 的 SimpleSFTP Mac 版本为 0.2.103，继续兼容 ≥0.2.102 共同更新租约协议。** 冻结 Windows SFTP **0.2.107 / fc962236210ca692397dd58eefbefd0bf108f85a**，配套参考 Experiment **0.5.403 / c30d607f1b63d224e8a65ab94371d86b4dd81c0d**。本版增加机器状态根传递、系统Python解析与精确busy拒绝，保留Mac独立认证、POSIX路径、CLI、更新租约和Darwin句柄证明。两仓483文件2963项通过，M5原生体验未验。源码见 [对齐说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-alignment-2026-10-24.md)，发行以 [preview-v0.5.316](https://github.com/zlinkw/SimpleExperiment-Mac/releases/tag/preview-v0.5.316) 的清单为准。包内根README旧版本文字不影响实际manifest版本；最新说明以在线仓库为准。
+**本配套 preview 的 SimpleSFTP Mac 版本为 0.2.104，继续兼容 ≥0.2.102 共同更新租约协议。** 冻结 Windows SFTP **0.2.114 / b2329b5de8b1723d03d7470af8dbb0dad96898d5**，配套参考 Experiment **0.5.416 / 45209ae43da37a0c4a2c9d82ca2aad88caef7b44**（Mac 配套版本 0.5.317）。本批对齐暂存槽过期回收、一次确认提前释放、隔离完成回执、传输忙快照、清理批次上限、consumer root 绑定、本地暂存收敛与交接标记新写入位置，保留Mac独立认证、POSIX路径、CLI、更新租约和Darwin句柄证明。本轮实际回归结果以当次串行测试日志为准，M5原生体验未验。源码见 [对齐说明](https://github.com/zlinkw/SimpleExperiment-Mac/blob/master/docs/windows-alignment-2026-10-27.md)，本批候选完成审核与合并后才发布 preview-v0.5.317，届时以该 Release 的清单为准；当前已发布的最新配套仍为 preview-v0.5.316。包内根README旧版本文字不影响实际manifest版本；最新说明以在线仓库为准。
 
 ## 安装和更新入口
 
@@ -36,6 +36,10 @@ Apple Silicon、macOS26+ 的 VS Code SSH/tar 传输扩展，配套 [SimpleExperi
 ## 传输、进度与清理
 
 保留Windows共同的命令、API、同步范围、错误分类和结算流程：**创建或打开远端项目、选择服务器、查看当前目标、上传工作区到目标、上传指定文件到目标、远端同步到本地、设置下载文件范围**。本机POSIX路径保留实际中文、空格和大小写；远端路径、类型、链接和范围按共同规则校验。
+
+交接标记的新写入位置是远端项目根下的 `simple_cluster/state/simple-sftp/handoff/`（保留你自定义的标记文件名）。远端项目根目录下的旧标记文件只作为只读兼容来源：仅当新位置文件确实不存在时才会读取一次；新位置文件损坏、为空或类型异常时不会回读旧文件，也不会提示清理旧文件。旧标记文件不会被写入、改名或删除，也不会进入上传或下载传输内容。
+
+暂存槽沿用共同的两代保留规则：同一 identity/lane 在 claim 前只就地回收本次身份最旧的已提交旧代，默认阈值 1 天且不得配得更短（`simpleSftpMac.autoReclaimExpiredCommittedSlots`、`simpleSftpMac.stagedSlotCommittedExpiryMs`）；时间不可读、格式异常、未来时间或自相矛盾一律按未过期处理，无后台扫描。未满 1 天的候选只能由用户一次确认后提前释放，确认只跳过持锁期间的年龄一条，身份、换代、提交态、绑定复检等其余判定全部保留。传输忙时隔离与清理一律 fail closed，隔离完成回执缺失即按未知处理不重放。
 
 SSH/tar保持流式传输；跨服务器经本机流式中转，分别认证两端。进度和清理状态以本轮查询为准，失败结束本轮等待并提供重查；旧回执不造成永久忙状态。Agent更新接口直接复用Windows受管Agent与独立Scheduler生命周期，保留已运行/排队任务。
 

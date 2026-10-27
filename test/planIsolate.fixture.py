@@ -61,16 +61,35 @@ frozen = isolate_request('run1')
 assert frozen['fingerprintMode'] == 'top_level' and 'contentFingerprint' not in frozen, frozen
 assert not data_reads, data_reads
 assert any(row.get('path') == 'artifact_manifest.json' for row in frozen['inventory'])
+# the engine itself answers the per-backend background-delete capability on
+# every isolate inspect; the plugin only advertises safety when it sees this.
+probe = run({'action': 'inspect', 'isolate': True, 'operationId': 'op-iso-probe', 'target': frozen})
+assert probe['ok'] is True and probe.get('backgroundIsolatedDelete') == 1, probe
+assert probe['target']['fingerprint'] == frozen['fingerprint'], probe
 
 # 2) isolate renames into the intent batch with no content reads; the pending
 # isolation mapping registers and MANIFEST facts stay inventory-free.
 done = run({'action': 'isolate', 'operationId': 'op-iso-run1', 'target': frozen})
 assert done['ok'] and done['receipt']['phase'] == 'completed'
+# 0.2.111 completion receipt: move-moment facts only, bound to this operation.
+receipt = done['receipt']
+assert receipt['isolationCompletionProtocol'] == 1 and receipt['renameCommitted'] is True \
+    and receipt['sourceMissingAtMove'] is True and receipt['registered'] is True \
+    and receipt['executorsChecked'] is True and receipt['executors'] == [], receipt
+assert receipt['archiveBatch'] == BATCH and receipt['sourceRelativePath'] == 'work_dirs/run1' \
+    and receipt['destinationRelativePath'] == 'clean_dir/' + BATCH + '/work_dirs/run1', receipt
 moved = root / 'clean_dir' / BATCH / 'work_dirs' / 'run1'
 assert moved.is_dir() and (moved / 'weight.bin').exists() and not weight_dir.exists()
 assert not data_reads, data_reads
 state = isolation_state('clean_dir/' + BATCH + '/work_dirs/run1')
 assert state and state['state'] == 'isolated' and state['destination'].endswith('work_dirs/run1'), state
+# the registration persists the same move-moment facts next to the stable identity
+assert state.get('isolationCompletionProtocol') == 1 and state.get('renameCommitted') is True \
+    and state.get('sourceMissingAtMove') is True and state.get('registered') is True \
+    and state.get('executorsChecked') is True and state.get('executors') == [], state
+assert state.get('archiveBatch') == BATCH and state.get('sourceRelativePath') == 'work_dirs/run1' \
+    and state.get('destinationRelativePath') == 'clean_dir/' + BATCH + '/work_dirs/run1', state
+assert state.get('device') is not None and state.get('inode') is not None, state
 manifest_lines = (root / 'clean_dir' / 'MANIFEST.md').read_text(encoding='utf-8').splitlines()
 assert any('"phase":"intent"' in line for line in manifest_lines) and any('"phase":"completed"' in line for line in manifest_lines)
 assert not any('"inventory"' in line for line in manifest_lines), 'isolate audit must stay a compact fact'
@@ -108,6 +127,11 @@ settled8 = run({'action': 'settle', 'settledAction': 'isolate', 'operationId': '
                 'target': {key: frozen8[key] for key in frozen_keys}})
 assert settled8['ok'] and settled8['receipt']['fingerprintMode'] == 'top_level', settled8
 assert isolation_state(crashed8)['state'] == 'isolated'
+# Honesty: a settle-repaired registration records the repaired fact ONLY. It
+# never fabricates the move-moment completion fields it did not witness.
+repaired8 = isolation_state(crashed8)
+assert 'isolationCompletionProtocol' not in repaired8 and 'renameCommitted' not in repaired8 \
+    and 'sourceMissingAtMove' not in repaired8 and 'registered' not in repaired8, repaired8
 assert (recreated8 / 'fresh.txt').read_text(encoding='utf-8') == 'fresh'
 
 # 3c) insufficient evidence: nothing was ever renamed and the canonical is
@@ -194,6 +218,21 @@ frozen_delete = run({'action':'batch-inspect', 'authorizationMode':'confirmed_pa
                      'operationId':'op-del-run2', 'targets':[delete_target]})['targets'][0]
 expect_code({'action':'delete', 'operationId':'op-old-delete',
              'target':{**delete_target, 'destination':archived_rel, 'authorizationMode':'confirmed_paths'}}, 'UPDATE_REQUIRED')
+# batch-inspect answers with the registration state and echoes the persisted
+# move-moment completion receipt verbatim (run1: full isolate path)...
+run1_probe = run({'action':'batch-inspect','authorizationMode':'confirmed_paths',
+                  'targets':[{'relativePath':'clean_dir/'+BATCH+'/work_dirs/run1','type':'directory'}]})['targets'][0]
+assert run1_probe.get('isolationState') == 'isolated', run1_probe
+echo = run1_probe.get('isolationCompletion') or {}
+assert echo.get('isolationCompletionProtocol') == 1 and echo.get('renameCommitted') is True \
+    and echo.get('sourceRelativePath') == 'work_dirs/run1' \
+    and echo.get('destinationRelativePath') == 'clean_dir/' + BATCH + '/work_dirs/run1', run1_probe
+# ... while the settle-repaired run2 registration stays registered-deletable
+# for the manual chain but echoes NO move-moment receipt: the background
+# entry must refuse it (NOT_ISOLATION_COMPLETION_RECEIPT) instead of trusting
+# a repaired record as if it witnessed the rename.
+assert frozen_delete.get('isolationState') == 'isolated', frozen_delete
+assert 'isolationCompletion' not in frozen_delete, frozen_delete
 # Allocate the replacement before removing the original, so inode reuse cannot
 # accidentally turn this replay test into an equal-inode fixture.
 replacement = root / 'fresh-replacement'
@@ -210,6 +249,11 @@ verified = run({'action':'batch-verify', 'authorizationMode':'confirmed_paths',
 assert verified['targets'][0]['status'] == 'gone', verified
 expect_code({'action':'delete-fast', 'authorizationMode':'confirmed_paths',
              'operationId':'op-del-run2', 'entries':[frozen_delete]}, 'MISSING_TARGET')
+# a missing archived entry is still distinguishable from an unexplained
+# absence: the registration answers "deleted", with no completion echo left.
+gone_probe = run({'action':'batch-inspect','authorizationMode':'confirmed_paths','targets':[delete_target]})['targets'][0]
+assert gone_probe['missing'] is True and gone_probe.get('archived') is True and gone_probe.get('isolationState') == 'deleted', gone_probe
+assert 'isolationCompletion' not in gone_probe, gone_probe
 # the deleted subtree's own confirmed-path check still reports completion through the registration.
 check_after = run({'action': 'check', 'target': {'relativePath': archived_rel, 'destination': archived_rel,
                 'type': 'directory', 'authorizationMode': 'confirmed_paths'}})
@@ -227,6 +271,14 @@ fresh_batch = 'job-' + 'c' * 48
 frozen2b = isolate_request('run2', batch=fresh_batch)
 run({'action':'isolate', 'operationId':'op-iso-run2b', 'target':frozen2b})
 assert isolation_state('clean_dir/' + fresh_batch + '/work_dirs/run2')['state'] == 'isolated'
+# a fresh full-path isolate in a NEW batch binds its completion to that batch:
+# the deleted old batch copy never answers for it.
+fresh_probe = run({'action':'batch-inspect','authorizationMode':'confirmed_paths',
+                   'targets':[{'relativePath':'clean_dir/' + fresh_batch + '/work_dirs/run2','type':'directory'}]})['targets'][0]
+fresh_echo = fresh_probe.get('isolationCompletion') or {}
+assert fresh_echo.get('isolationCompletionProtocol') == 1 and fresh_echo.get('archiveBatch') == fresh_batch \
+    and fresh_echo.get('sourceRelativePath') == 'work_dirs/run2' \
+    and fresh_echo.get('destinationRelativePath') == 'clean_dir/' + fresh_batch + '/work_dirs/run2', fresh_probe
 assert isolation_state(archived_rel)['state'] == 'deleted'
 assert (root / archived_rel / 'fresh.bin').read_text(encoding='utf-8') == 'keep'
 
@@ -239,6 +291,7 @@ unregistered = 'clean_dir/' + BATCH + '/never/registered'
 (root / unregistered).mkdir(parents=True)
 unbound = run({'action':'batch-inspect','authorizationMode':'confirmed_paths',
                'targets':[{'relativePath':unregistered,'type':'directory'}]})['targets'][0]
+assert unbound.get('isolationState') is None and 'isolationCompletion' not in unbound, unbound
 expect_code({'action':'delete-fast','authorizationMode':'confirmed_paths','operationId':'op-unbound','entries':[unbound]},
             'NOT_REGISTERED_ISOLATION')
 assert (root / unregistered).is_dir()

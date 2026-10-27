@@ -37,7 +37,29 @@ test('delta stream transfers changed content only and reports compared versus ch
   let dispatched, transferred = false;
   const updates = [];
   const controller = { id: 'one', updateProgress(row) { updates.push(row); } };
+  // r118 closure: the extracted core now also consults the claim-scoped expiry reclaim wiring.
+  // The fixture pins the REAL closure dependencies with deterministic stand-ins: pure scope from
+  // the module itself, fixed lane identities, and reclaim/attach probes that record every call so
+  // a silent skip or a spurious invocation is visible (this scenario never hits a pending error).
+  const reclaimCalls = [], stageBlockAttempts = [];
+  // The production catch{} may swallow reclaim probe problems BY DESIGN — so the fixture must make
+  // "did the wiring actually run?" explicit: every sandbox identifier the reclaim call site
+  // evaluates (extension.js 2294-2303 argument set) is provided here, and the stub records that it
+  // received THE singleton cleanupFileApi object, not an undefined stand-in.
+  const cleanupFileApi = {};
   const sandbox = { Date, String, Number, Set, Map, Array, Object, Math, Error,
+    vscode: { workspace: { workspaceFolders: [] } },
+    cleanupFileApi,
+    // The core now normalizes the run generation EXACTLY like the receiver request builder does;
+    // the fixture ships the real module function so this pins that closure dependency too.
+    transferScope64: __test.transferScope64,
+    stagedScope: __test.stagedScope, stagedLogicalKey: () => 'e'.repeat(64),
+    stagedSlotExpirySettings: () => ({ enabled: true, expiryMs: 86400000 }),
+    reclaimExpiredStagedSlots: async ({ lane, identity, generation, api }) => {
+      reclaimCalls.push({ lane, identity, generation, apiIsSingleton: api === cleanupFileApi });
+      return { attempted: false, outcome: 'not-accepted', reason: 'no-consumer-root', lane }; // mirrors the production skip for a fixture without a consuming project
+    },
+    attachStagedStageBlock: async () => { stageBlockAttempts.push(1); },
     requestedTransferCompression: () => 'none', directSyncTarget: value => value, directSyncRelativePath: value => value,
     transferTimeoutMs: () => 120000, transferContext: { getStore: () => controller },
     // Mac 产品核对在清单前执行原生认证握手；Windows 派生切片测试需声明该 Mac 步骤已完成。
@@ -75,6 +97,15 @@ test('delta stream transfers changed content only and reports compared versus ch
     relativePaths: paths }, { report() {} });
   assert.equal(dispatched.length,0); assert.equal(repeated.transferredFiles,0);
   assert.equal(repeated.unchangedFiles,6); assert.equal(repeated.missingFiles,0); assert.equal(repeated.differentFiles,0);
+  // The reclaim wiring ran exactly once per fixed lane before the planned transfer, with this
+  // run's generation, and again never for the all-identical repeat; the stage-block attach is
+  // never touched by this error-free scenario.
+  // The controller id 'one' is a PLAIN run id: the core must hand the reclaim wiring the same
+  // 64-hex normalization the staging request carries, never the raw value.
+  assert.deepEqual(reclaimCalls, [
+    { lane: 0, identity: 'e'.repeat(64), generation: __test.transferScope64('one'), apiIsSingleton: true },
+    { lane: 1, identity: 'e'.repeat(64), generation: __test.transferScope64('one'), apiIsSingleton: true }]);
+  assert.deepEqual(stageBlockAttempts, []);
 });
 
 test("direct rsync scopes delete to one Plan directory", () => {

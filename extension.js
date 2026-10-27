@@ -8,6 +8,8 @@ const transferCapacity = new TransferCapacity();
 const metadataTreeCapacity = new TransferCapacity();
 const metadataInventoryCapacity = new TransferCapacity();
 const cleanupReadCapacity = new TransferCapacity();
+// 0.2.111 隔离区后台删除走独立的受限并发维护通道：既不与批量传输抢容量，也不得被借用为读池。
+const maintenanceCleanupCapacity = new TransferCapacity();
 // Short, exact code checks cannot queue behind a recursive artifact inventory.
 // Each lane remains bounded to two servers globally and one read per server.
 const codeInventoryCapacity = new TransferCapacity();
@@ -141,7 +143,7 @@ const DEFAULT_IGNORES = [
 ];
 
 // These editor and Git internals never belong in a project transfer.
-const FIXED_IGNORES = [".git", ".vscode", ".simple-sftp-stage-*", "*.simple-sftp-partial-*"];
+const FIXED_IGNORES = [".git", ".vscode", ".simple-sftp-stage-*", ".simple-sftp-staging", "*.simple-sftp-partial-*"];
 
 const HIDDEN_TOP_LEVEL = new Set([
   ".codex",
@@ -851,7 +853,7 @@ function directSyncRelativePath(value) {
   if (Buffer.byteLength(relative, "utf8") > 4096 || /[:\0\r\n]/.test(relative)) throw new Error("Plan 产物相对路径不安全。");
   if (!relative || relative.startsWith("/") || relative.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Plan 产物相对路径不安全。");
   if (relative.split("/").some(part => part.toLowerCase() === "clean_dir")) throw new Error("归档目录不参与同步或收集。");
-  if (relative.split("/").some((part) => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) throw new Error("路径保留给 SimpleSFTP 传输暂存使用。");
+  if (relative.split("/").some((part) => part.startsWith(".simple-sftp-stage-") || part === ".simple-sftp-staging" || part.includes(".simple-sftp-partial-"))) throw new Error("路径保留给 SimpleSFTP 传输暂存使用。");
   return relative;
 }
 
@@ -964,7 +966,7 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
   if (!paths.length) return Promise.resolve();
   const compression = transferCompression(options);
   const sourceCommand = options.sourceCommand || `bash -o pipefail -c ${shellQuote(`root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && test "$(pwd -P)" = "$root" && ${tarPackingCommand(compression)}`)}`;
-  const destinationCommand = options.destinationCommand || `bash -o pipefail -c ${shellQuote(stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, paths) )}`;
+  const destinationCommand = options.destinationCommand || `bash -o pipefail -c ${shellQuote(stagedTarUnpackingCommand(destination, compression, options, options.expectedFiles, paths) )}`;
   return new Promise((resolve, reject) => {
     getSshArgs(source, sourceCommand); getSshArgs(destination, destinationCommand);
     let reader, writer;
@@ -1330,7 +1332,7 @@ function projectInventoryScript(metadataOnly = false) {
 
 function projectTreePathAllowed(relative) {
   const parts = String(relative || "").toLowerCase().split("/");
-  if (parts.some(part => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) return false;
+  if (parts.some(part => part.startsWith(".simple-sftp-stage-") || part === ".simple-sftp-staging" || part.includes(".simple-sftp-partial-"))) return false;
   if (parts[0] === "tmp" && parts.length > 1 && parts[1] !== "result" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
   if (parts[0] === "experiments" && parts[1] === "results" && parts.at(-1).endsWith(".csv.lock")) return false;
   if (parts[0] === "work_dirs" && parts.at(-1) === ".tb_mean.lock") return false;
@@ -1429,7 +1431,7 @@ function transferErrorLog(paths = []) {
   const append = line => {
     const text = line.trim();
     if (!text || filenames.has(text) || /^SIMPLE_(?:CHUNK_VERIFIED|COMPRESSION_WIRE) \d+$/.test(text)
-      || /^SIMPLE_STAGE_COMMITTED \.simple-sftp-stage-[0-9a-f]{2}$/.test(text)) return;
+      || /^SIMPLE_STAGE_COMMITTED (?:d-[0-9a-f]{24}\/[01]|\.simple-sftp-stage-[0-9a-f]{2})$/.test(text)) return;
     if (text.startsWith("SIMPLE_PROGRESS ")) {
       try {
         const row = JSON.parse(text.slice(16));
@@ -1751,12 +1753,16 @@ const API_METHOD_CAPABILITIES = {
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
-      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, backgroundIsolatedDelete: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
-      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1 },
+      "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 },
+      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, isolationCompletionReceipt: 1 },
+      // 0.2.111 后台删除入口：只接受已登记隔离 token，删除集合由插件登记记录派生；
+      // 它仍是远端修改（不声明 readOnly），但作为隔离区维护任务不长期占用传输忙。
+      "files.cleanup.isolatedMaintenanceDelete": { registeredIsolationTokenOnly: 1, pluginDerivedDeleteSet: 1, isolationCompletionReceiptRequired: 1, clientSuppliedDestinations: false, maintenanceChannel: 1, executorEvidenceAtMoveOnly: 1, userConfirmedSlotRelease: 1 },
       "sync.projectInventory": { scopeTransport: "stdin",
         readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
-      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
+      "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
     };
 
@@ -1881,22 +1887,181 @@ function tarUnpackingCommand(compression) {
   return `${decoder}tar -xvf - --index-file=/dev/stderr`;
 }
 
-function stagedTarUnpackingCommand(destination, compression, stageId, expectedFiles = {}, paths = Object.keys(expectedFiles)) {
+function transferScope64(value) {
+  const text = String(value || "");
+  return /^[0-9a-f]{64}$/.test(text) ? text : crypto.createHash("sha256").update(text).digest("hex");
+}
+
+// Logical identity of a staging source: the destination PROJECT path plus the sorted set of
+// project-relative source paths. It never contains stage ids, content hashes, Worker/GPU or node
+// identities, so the same logical source keeps ONE two-generation slot across workers and reruns;
+// generation is the caller's stable run/command id (retries and extra batches reuse it).
+function stagedScope(options = {}) {
+  // The caller-declared stable scope shown in the structured stage block: the SAME string the
+  // identity hashes over, never a recomputed or display-only variant.
+  return String(options.retentionKey || (options.directory ? "directory:" + options.relativePath : "project-files"));
+}
+
+function stagedLogicalKey(destinationRemotePath, paths, options = {}) {
+  // Scope is declared by the caller, not the current changed-file selection or content.
+  // Two fixed lanes belong to the same job/run; changing archive partitions opens no new keys.
+  const scope = stagedScope(options);
+  return transferScope64(JSON.stringify([scope, Number(options.stagingLane) === 1 ? 1 : 0]));
+}
+
+// The ruled 1-day floor: the AUTOMATIC chain can never be configured below it (early reclaim of a
+// under-threshold candidate stays a per-batch user-confirmed release, never a config side door).
+const STAGED_SLOT_DEFAULT_EXPIRY_MS = 86400000;
+
+function stagedSlotExpirySettings() {
+  // Mac 适配：同一对共同能力项在 Mac 侧按 simpleSftpMac.* 命名空间登记（API_CONFIG_NAMESPACE），
+  // 默认值与 1 天下限不变，仅读取入口改用 Mac 命名空间映射，不新建旁路配置。
+  const config = vscode.workspace.getConfiguration(API_CONFIG_NAMESPACE);
+  const enabled = simpleSftpConfigValue(config, `${API_CONFIG_PREFIX}autoReclaimExpiredCommittedSlots`) === true;
+  const raw = Number(simpleSftpConfigValue(config, `${API_CONFIG_PREFIX}stagedSlotCommittedExpiryMs`));
+  const expiryMs = Number.isFinite(raw) && raw > STAGED_SLOT_DEFAULT_EXPIRY_MS ? Math.floor(raw) : STAGED_SLOT_DEFAULT_EXPIRY_MS;
+  return { enabled, expiryMs };
+}
+
+function stagedSlotStageBlock(context, report) {
+  // The structured TRANSFER_STAGE_PENDING stage block (schemaVersion 1). Python side supplies ONLY
+  // slot facts; host/profile/scope/lane are filled in HERE by the calling JS layer. The complete
+  // readable error text stays on error.message — this block is additive evidence, never a path the
+  // caller has to parse, and every backend binding for a release still uses the FULL values below.
+  const rows = Array.isArray(report && report.slots) ? report.slots : [];
+  const leaving = (Array.isArray(report && report.stale) ? report.stale : [])[0];
+  const time = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const slots = rows.map(row => ({
+    slot: String(row.path || "").split("/").pop(),
+    path: String(row.path || ""),
+    generation: String(row.generation || ""),
+    status: String(row.status || "unresolved"),
+    createdAt: time(row.createdAt),
+    terminalAt: time(row.terminalAt),
+    updatedAt: time(row.updatedAt),
+    timeSource: typeof row.timeSource === "string" ? row.timeSource : null,
+    ageMs: Number.isInteger(row.ageMs) ? row.ageMs : null,
+    locked: row.locked === true,
+    protectedReason: typeof row.protectedReason === "string" ? row.protectedReason : null,
+  }));
+  return {
+    schemaVersion: 1,
+    code: "TRANSFER_STAGE_PENDING",
+    destination: { id: String(context.destination?.id || context.destination?.host || ""),
+      profile: String(context.profile || ""), host: String(context.destination?.host || "") },
+    scope: String(context.scope || ""),
+    lane: Number(context.lane) === 1 ? 1 : 0,
+    identity: String(context.identity || ""),
+    incomingGeneration: String(context.incomingGeneration || ""),
+    slots,
+    // A releasable candidate is ONLY a structured, unlocked, committed leaving slot — never a
+    // locked, non-terminal, unresolved or time-unknown one, and never derived from error text.
+    releaseCandidate: Boolean(leaving) && String(leaving.status) === "committed" && leaving.locked !== true,
+  };
+}
+
+async function attachStagedStageBlock(error, context) {
+  // Fresh read-only facts at refuse time; the block and the enriched text travel with the ORIGINAL
+  // error (message prefix preserved verbatim). A failing probe must never replace the real error.
+  const node = { kind: "remote", host: context.destination.host, user: context.destination.username,
+    port: context.destination.port, root: context.destination.remotePath };
+  const report = await stagedSlotStaleReport(node, context.identity, context.incomingGeneration, context.expiryMs);
+  const block = stagedSlotStageBlock(context, report);
+  error.stageBlock = block;
+  error.apiData = { ...(error.apiData && typeof error.apiData === "object" ? error.apiData : {}), stageBlock: block };
+  const profileText = block.destination.profile ? `（profile ${block.destination.profile}）` : "";
+  error.message = `${error.message} · 暂存槽卡点：主机 ${block.destination.host}${profileText} · 范围 ${block.scope} · 通道 ${block.lane} · 身份 ${block.identity.slice(0, 12)}… · 待进入代 ${block.incomingGeneration.slice(0, 12)}…`;
+  return error;
+}
+
+async function reclaimExpiredStagedSlots(options = {}) {
+  // Ruled claim-scoped reclaim: inspect ONLY this run's identity/lane, act ONLY on the single
+  // leaving slot the REMOTE clock proves committed and older than the threshold, and route it
+  // through the existing preview → one confirm → isolate → completion-proven → registered-delete
+  // chain. No global scan, no background service. Any non-completed observation, unknown receipt
+  // or refused delete STOPS without replay; the transfer then surfaces its unchanged
+  // TRANSFER_STAGE_PENDING plus the structured stage block.
+  const { destination, identity, generation, scope, lane, consumerRoot, api, expiryMs } = options;
+  if (!api || typeof api.preview !== "function") return { attempted: false, reason: "no-cleanup-api" };
+  if (!/^[0-9a-f]{64}$/.test(String(identity || "")) || !/^[0-9a-f]{64}$/.test(String(generation || ""))) return { attempted: false, reason: "invalid-scope" };
+  const root = String(consumerRoot || "");
+  if (!root || !path.isAbsolute(root) || /[\x00\r\n]/.test(root)) return { attempted: false, reason: "no-consumer-root" };
+  const node = { kind: "remote", host: destination.host, user: destination.username, port: destination.port, root: destination.remotePath };
+  const report = await stagedSlotStaleReport(node, identity, generation, expiryMs);
+  const leaving = (report.stale || [])[0];
+  if (!leaving) return { attempted: false, reason: "no-leaving-candidate", lane, identity };
+  if (leaving.expiredCommitted !== true || leaving.status !== "committed" || leaving.locked === true) {
+    return { attempted: false, reason: String(leaving.expiryReason || "not-expired"), lane, identity };
+  }
+  const relativePath = String(leaving.path || "");
+  if (!relativePath) return { attempted: false, reason: "no-leaving-path", lane, identity };
+  // P1-3 ruling: the authorization binds to THIS journal, not merely to a path. identity, the
+  // committed generation, the terminal moment and the expiry threshold ride the frozen preview
+  // row and reach the engine's under-lock rename so a resumed, regenerated or freshly
+  // re-committed slot can never be isolated on the earlier verdict. A candidate whose binding
+  // facts are unusable is fail-closed skipped, never reclaimed.
+  const leavingGeneration = String(leaving.generation || "");
+  if (!/^[0-9a-f]{64}$/.test(leavingGeneration)) return { attempted: false, reason: "no-leaving-generation", lane, identity };
+  const expectedStagedJournal = { identity, generation: leavingGeneration, status: "committed",
+    terminalAt: Number.isInteger(leaving.terminalAt) && leaving.terminalAt > 0 ? leaving.terminalAt : null, expiryMs };
+  const archiveBatch = "job-" + crypto.createHash("sha256")
+    .update(JSON.stringify(["staged-slot-reclaim", identity, leaving.generation, relativePath, crypto.randomBytes(8).toString("hex")])).digest("hex").slice(0, 48);
+  const preview = await api.preview({ node, action: "isolate", consumerRoot: root, authorizationSource: "auto_expiry_reclaim",
+    stagedJournal: expectedStagedJournal,
+    targets: [{ relativePath, type: "directory", archiveBatch, destination: "clean_dir/" + archiveBatch + "/" + relativePath }] });
+  const pending = preview.targets.map((target, index) => ({ target, index })).filter(({ target }) => !target.missing);
+  if (!pending.length) return { attempted: true, outcome: "unknown", reason: "candidate-vanished", lane, identity };
+  try {
+    await api.confirm({ token: preview.token, digest: preview.digest, confirm: true, phase: 1, consumerRoot: root,
+      exactTargets: preview.targets.filter(target => !target.missing).map(target => target.absolutePath) });
+    for (const { index } of pending) await api.execute({ token: preview.token, digest: preview.digest, index, consumerRoot: root });
+    // Bounded wait for the ISOLATION completion proof only (the delete itself is the maintenance
+    // channel and never blocks this decision). "unknown" states stop the wait — never re-sent.
+    let isolated = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const row = await api.status({ token: preview.token, consumerRoot: root });
+      if (pending.every(({ index }) => row.states[index] === "completed")) { isolated = true; break; }
+      if (pending.some(({ index }) => row.states[index] === "unknown")) break;
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+    if (!isolated) return { attempted: true, outcome: "unknown", reason: "isolation-completion-not-proven", lane, identity, token: preview.token };
+    // Permanent deletion derives its set EXCLUSIVELY from this frozen ledger token; without the
+    // move-time completion proof the entry itself refuses (NOT_ISOLATION_COMPLETION_RECEIPT).
+    const deletion = await api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, consumerRoot: root,
+      targets: pending.map(({ index, target }) => ({ index, relativePath: target.relativePath, destination: target.destination })) });
+    const state = String(deletion && deletion.state || "unknown");
+    return { attempted: true, outcome: ["accepted", "already_accepted"].includes(state) ? "accepted" : "not-accepted",
+      deleteState: state, isolationProven: true, lane, identity, token: preview.token, digest: preview.digest };
+  } catch (error) {
+    // An error after mutations were sent is an UNKNOWN outcome, not a retry signal: the ledger
+    // (batchExecuting / isolatedDelete lifecycle) is what later readers resolve against.
+    return { attempted: true, outcome: "unknown", reason: String(error && error.code || error && error.message || "reclaim-failed").slice(0, 200),
+      lane, identity, token: preview.token, digest: preview.digest };
+  }
+}
+
+function stagedTarUnpackingCommand(destination, compression, options = {}, expectedFiles = {}, paths = Object.keys(expectedFiles)) {
   const entries = paths.map(name => {
     const item = expectedFiles[name];
     return { path: directSyncRelativePath(name), sha256: typeof item === "string" ? item : item?.sha256 || "", size: typeof item?.size === "number" ? item.size : null };
   });
-  const identity = crypto.createHash("sha256").update(String(stageId || "") + JSON.stringify(entries)).digest("hex");
-  const request = Buffer.from(JSON.stringify({ root: destination.remotePath, identity, entries }), "utf8");
+  if (typeof options === "string") options = { generation: options };
+  const identity = stagedLogicalKey(destination.remotePath, paths.map(name => directSyncRelativePath(name)), options);
+  const generation = transferScope64(options.generation || options._operationId || options.transferId || transferContext.getStore()?.operationId || identity);
+  const request = Buffer.from(JSON.stringify({ root: destination.remotePath, identity, generation, entries }), "utf8");
   if (request.length > 65536) throw new Error("暂存 manifest 超过有界大小，必须拆分批次。");
   const payload = require("node:zlib").deflateRawSync(request).toString("base64");
   const decoder = compression === "zstd" ? "zstd -dc | " : compression === "none" ? "" : "gzip -dc | ";
   return decoder + stagedReceiverInvocation(payload);
 }
 
-function stagedReceiverInvocation(payload) {
+function stagedReceiverCode() {
   const source = fs.readFileSync(path.join(__dirname, "staged-tar-receive.py"), "utf8");
-  const code = require("node:zlib").deflateSync(Buffer.from(source, "utf8")).toString("base64");
+  return require("node:zlib").deflateSync(Buffer.from(source, "utf8")).toString("base64");
+}
+
+function stagedReceiverInvocation(payload) {
+  const code = stagedReceiverCode();
   const loader = "import base64,zlib,sys; code=zlib.decompress(base64.b64decode(sys.argv[1])); sys.argv=sys.argv[1:]; exec(compile(code,'simple_sftp_staged_receive','exec'))";
   return `python3 -c ${shellQuote(loader)} ${shellQuote(code)} ${shellQuote(payload)}`;
 }
@@ -1904,7 +2069,7 @@ function stagedReceiverInvocation(payload) {
 function directTarBatchCommand(source, destination, options = {}) {
   const compression = transferCompression(options);
   const destinationHost = `${destination.username}@${destination.host}`;
-  const destinationScript = stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, options.groupPaths);
+  const destinationScript = stagedTarUnpackingCommand(destination, compression, options, options.expectedFiles, options.groupPaths);
   const destinationCommand = `bash -o pipefail -c ${shellQuote(destinationScript)}`;
   const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
   const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && ${tarPackingCommand(compression, options.wireTelemetry === true)} | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
@@ -1914,6 +2079,45 @@ function directTarBatchCommand(source, destination, options = {}) {
 function chunkTransferCommand(target, request) {
   const payload = require("node:zlib").deflateRawSync(Buffer.from(JSON.stringify({ ...request, root: target.remotePath }), "utf8")).toString("base64");
   return stagedReceiverInvocation(payload);
+}
+
+// Read-only classification of one logical source's staging slots. WITH an incoming generation this is
+// the admission preview: the returned leaving slot (current/previous stay protected) becomes an exact
+// subtree candidate that ONLY continues through files.cleanup.preview(confirmed_paths) and both path
+// confirmations before the batched executor runs — never auto-confirmed. WITHOUT a generation the
+// inventory never proposes the retained two generations at all.
+function stagedSlotStaleReportCommand(target, identity, generation, expiryMs) {
+  // `expiry: {ms}` ONLY travels when a caller asked for the remote-clock expiry verdict; the plain
+  // inventory/admission commands stay byte-identical for every older consumer of this protocol.
+  const payload = require("node:zlib").deflateRawSync(Buffer.from(JSON.stringify({ mode: "staleReport", root: target.remotePath, identity,
+    ...(generation ? { generation } : {}), ...(Number.isInteger(expiryMs) && expiryMs > 0 ? { expiry: { ms: expiryMs } } : {}) }), "utf8")).toString("base64");
+  return stagedReceiverInvocation(payload);
+}
+
+async function stagedSlotStaleReport(node, identity, generation, expiryMs) {
+  if (node?.kind === "local") return { stale: [], held: [], slots: [] };
+  if (!/^[0-9a-f]{64}$/.test(String(identity || "")) || (generation != null && generation !== "" && !/^[0-9a-f]{64}$/.test(String(generation)))) cleanupFail("INVALID_REQUEST");
+  const target = directSyncTarget({ host: node.host, username: node.user, port: node.port, remotePath: node.root }, "清点暂存槽");
+  const reply = await runRemoteBatchSsh(target, stagedSlotStaleReportCommand(target, identity, generation ? String(generation) : undefined, expiryMs), [], 20000, { stage: "清点暂存槽" });
+  const report = JSON.parse(reply);
+  return { stale: Array.isArray(report.stale) ? report.stale : [], held: Array.isArray(report.held) ? report.held : [],
+    slots: Array.isArray(report.slots) ? report.slots : [] };
+}
+
+function stagedSlotCleanupCandidates(report) {
+  // Additive structured facts ride along so a capable caller can render the exact release preview
+  // without ever parsing paths out of error text; older consumers keep the original fields verbatim.
+  return (report.stale || []).map(row => ({ relativePath: row.path, type: "directory", status: row.status, logicalKey: row.identity || "",
+    generation: row.generation || "", updatedAt: row.updatedAt || 0,
+    createdAt: Number.isFinite(Number(row.createdAt)) ? Number(row.createdAt) : 0,
+    terminalAt: Number.isFinite(Number(row.terminalAt)) ? Number(row.terminalAt) : 0,
+    timeSource: typeof row.timeSource === "string" ? row.timeSource : null,
+    ageMs: Number.isInteger(row.ageMs) ? row.ageMs : null,
+    expiredCommitted: row.expiredCommitted === true,
+    expiryReason: typeof row.expiryReason === "string" ? row.expiryReason : null,
+    locked: row.locked === true,
+    releaseCandidate: row.status === "committed" && row.locked !== true,
+    protectedReason: typeof row.protectedReason === "string" ? row.protectedReason : null }));
 }
 
 function remoteTransferOutcomeUnknown() {
@@ -1926,8 +2130,12 @@ async function transferChunkedServerFile(source, destination, name, timeoutMs, o
     const entry = options.expectedFiles?.[name];
     if (!entry || !Number.isSafeInteger(entry.size) || entry.size > 64 * 1024 * 1024 * 1024 || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")) throw new Error("大文件分块需要完整 SHA256/size，单文件上限 64GiB。");
     const entries = [{ path: name, sha256: entry.sha256, size: entry.size }];
-    const identity = crypto.createHash("sha256").update(JSON.stringify([destination.remotePath, entries])).digest("hex");
-    const request = { identity, entries };
+    // Stable source scope: destination project path + relative file name — identical across
+    // retries/workers; the generation is the caller's stable run id so one run resumes its own
+    // checkpoint instead of opening a new generation.
+    const identity = stagedLogicalKey(destination.remotePath, [directSyncRelativePath(name)], options);
+    const generation = transferScope64(options.generation || options._operationId || options.transferId || transferContext.getStore()?.operationId || identity);
+    const request = { identity, generation, entries };
     // Checkpoint reconciliation can create/truncate an owned staging file and write its journal.
     // A disconnected status request therefore requires the same settlement protection as writes.
     const reply = await runRemoteBatchSsh(destination, chunkTransferCommand(destination, { ...request, mode: "chunkStatus" }), [], timeoutMs, { remoteMutation: true, stage: "核验分块检查点" });
@@ -1945,7 +2153,15 @@ async function transferChunkedServerFile(source, destination, name, timeoutMs, o
       await relayTarFilesCore(source, destination, [name], timeoutMs, { ...options, sourceCommand, destinationCommand });
       return;
     }
-    const direct = `bash -o pipefail -c ${shellQuote(`${read} | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port} ${shellQuote(`${destination.username}@${destination.host}`)} ${shellQuote(destinationCommand)}`)}`;
+    // Both endpoints execute the identical pinned receiver. Send its compressed code once in
+    // the SSH command, expanding a quoted base64-only shell variable into both invocations.
+    // This preserves the bounded command frame as the guarded receiver grows.
+    const receiverCode = stagedReceiverCode();
+    const sharedCode = "'\"$simple_sftp_receiver\"'";
+    const directRead = read.replace(receiverCode, sharedCode);
+    const directDestination = shellQuote(destinationCommand).replace(receiverCode, sharedCode);
+    const directScript = `simple_sftp_receiver=${shellQuote(receiverCode)}; ${directRead} | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port} ${shellQuote(`${destination.username}@${destination.host}`)} ${directDestination}`;
+    const direct = `bash -o pipefail -c ${shellQuote(directScript)}`;
     try { await runRemoteBatchSsh(source, direct, [], timeoutMs, { ...options, stage: options.compression === "none" ? "分块传输" : "压缩分块传输" }); }
     catch (error) {
       if (remoteTransferOutcomeUnknown() || !/host key verification failed|no .* host key|permission denied|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
@@ -1979,7 +2195,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
     failed = true;
     if (!failure) failure = error;
   };
-  const workers = Array.from({ length: Math.min(FPSYNC_PARALLEL_STREAMS, groups.length) }, async () => {
+  const workers = Array.from({ length: Math.min(FPSYNC_PARALLEL_STREAMS, groups.length) }, async (_, stagingLane) => {
     try {
       while (next < groups.length) {
         if (failed) return;
@@ -1991,7 +2207,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
         if (failed) return;
         const transferId = require("crypto").createHash("sha256").update(group.join("\0")).digest("hex").slice(0, 32);
         if (group.length === 1 && Number(options.fileSizes?.[group[0]]) > FPSYNC_MAX_BATCH_BYTES) {
-          await transferChunkedServerFile(source, destination, group[0], timeoutMs, options);
+          await transferChunkedServerFile(source, destination, group[0], timeoutMs, { ...options, stagingLane });
           if (failed) return;
           completed += 1;
           completedFiles += 1;
@@ -1999,25 +2215,27 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
           continue;
         }
         if (process.platform === "darwin") {
-          await relayTarFilesCore(source, destination, group, timeoutMs, { ...options, transferId });
+          await relayTarFilesCore(source, destination, group, timeoutMs, { ...options, stagingLane, transferId });
           if (failed) return;
           completed += 1;
           completedFiles += group.length;
           report("done", index + 1, group);
           continue;
         }
-        const directCommand = directTarBatchCommand(source, destination, { ...options, transferId, groupPaths: group });
+        const directCommand = directTarBatchCommand(source, destination, { ...options, stagingLane, transferId, groupPaths: group });
         try {
           await runRemoteBatchSsh(source, directCommand, group, timeoutMs, options);
         } catch (error) {
+          if (error instanceof Error && error.stagingLane === undefined) error.stagingLane = stagingLane;
           const retryable = /host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error));
           if (!retryable || remoteTransferOutcomeUnknown()) {
             noteFailure(error);
             return;
           }
           try {
-            await relayTarFiles(source, destination, group, timeoutMs, { ...options, transferId });
+            await relayTarFiles(source, destination, group, timeoutMs, { ...options, stagingLane, transferId });
           } catch (relayError) {
+            if (relayError instanceof Error && relayError.stagingLane === undefined) relayError.stagingLane = stagingLane;
             noteFailure(relayError);
             return;
           }
@@ -2028,6 +2246,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
         report("done", index + 1, group);
       }
     } catch (error) {
+      if (error instanceof Error && error.stagingLane === undefined) error.stagingLane = stagingLane;
       noteFailure(error);
       throw error;
     }
@@ -2076,6 +2295,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     const groups = snapshot.totalGroups ? ` · 分组 ${snapshot.completedGroups || 0}/${snapshot.totalGroups}` : "";
     progress.report({ message: `${label} · ${files}${groups} · ${Math.round(bytes / 1024)} KiB${wire ? " 实际流字节" : " 已处理"} · 已耗时 ${Math.floor((Date.now() - notifyStartedAt) / 1000)} 秒` });
   });
+  let stageBlockContext = null;
   try {
   const requestedCompression = requestedTransferCompression(options);
   const source = directSyncTarget(options.source, "来源");
@@ -2141,9 +2361,37 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     : { compression: requestedCompression === "none" ? "none" : requestedCompression === "zstd" ? "zstd" : "gzip", reason: "no-changed-files", sampleBytes: 0 };
   const compression = compressionDecision.compression;
   let wireBytes = 0;
-  const effectiveOptions = { ...options, compression, expectedFiles: sourceHashes, wireTelemetry: true, onWireBytes: (count) => { wireBytes += count; } };
+  const effectiveOptions = { ...options, generation: options.generation || options._operationId || transferController?.operationId || transferController?.id || nextTransferId("staging"), compression, expectedFiles: sourceHashes, wireTelemetry: true, onWireBytes: (count) => { wireBytes += count; } };
   const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80,
     FPSYNC_PARALLEL_STREAMS, fileSizes, FPSYNC_MAX_BATCH_BYTES);
+  // Claim-scoped expiry reclaim for THIS run's identities only (ruled Q2): before the receiver
+  // claims, each lane of this scope gets one read-only admission report; an expired committed
+  // leaving slot is reclaimed through the existing managed isolate-then-delete chain. No scan of
+  // any other identity, no background service, and every unknown outcome just leaves the classic
+  // fail-closed pending error in place (now enriched with the structured stage block).
+  // EXACTLY the receiver's own normalization (transferScope64 over options.generation, which the
+  // effective options always set): a plain supported run id like "run-1" must reach the reclaim
+  // check, the reclaim itself and the stage-block probe as the same 64-hex generation the
+  // staging request carries — the raw value would fail invalid-scope/`generation` comparison and
+  // silently disable both new features. transferScope64 is idempotent, so hex ids stay identical.
+  const stageGeneration = transferScope64(effectiveOptions.generation);
+  const stageScopeText = stagedScope(effectiveOptions);
+  const stageIdentities = [0, 1].map(stagingLane => stagedLogicalKey(destination.remotePath, [], { ...effectiveOptions, stagingLane }));
+  const stageExpiry = stagedSlotExpirySettings();
+  stageBlockContext = { destination, generation: stageGeneration, scope: stageScopeText, identities: stageIdentities,
+    profile: String(options.profile || destination.profile || ""), expiryMs: stageExpiry.expiryMs };
+  const stagedSlotReclaim = [];
+  if (stageExpiry.enabled && planned.length) {
+    const reclaimConsumerRoot = typeof options.consumerRoot === "string" && options.consumerRoot ? options.consumerRoot
+      : String(vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath || "");
+    for (const stagingLane of [0, 1]) {
+      try {
+        stagedSlotReclaim.push(await reclaimExpiredStagedSlots({ destination, scope: stageScopeText, lane: stagingLane,
+          identity: stageIdentities[stagingLane], generation: stageGeneration,
+          consumerRoot: reclaimConsumerRoot, api: cleanupFileApi, expiryMs: stageExpiry.expiryMs }));
+      } catch { /* reclaim probes are never allowed to mask or delay the transfer decision itself */ }
+    }
+  }
   progress.report({ message: changed.length
     ? "清单完成（" + inventoryMs + " ms）；跳过相同 " + unchangedFiles + "，目标缺失 " + missingFiles + "，内容不同 " + differentFiles + "；采用" + (compression === "none" ? "无压缩" : compression === "zstd" ? "zstd 压缩" : "gzip 压缩") + "流处理 " + changed.length + "/" + paths.length + " 个文件，共 " + planned.length + " 组"
     : `清单完成（${inventoryMs} ms）；${paths.length} 个文件均无需传输，准备校验…` });
@@ -2188,7 +2436,21 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过 · 清单 ${timing.inventoryMs} ms · 流处理 ${timing.streamMs} ms · 校验 ${timing.verifyMs} ms`);
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", compression, singleStream: options.singleStream === true,
-    directory, relativePath, timing, hashCache, compressionDecision, wireBytes, missingFiles, differentFiles, unchangedFiles };
+    directory, relativePath, timing, hashCache, compressionDecision, wireBytes, missingFiles, differentFiles, unchangedFiles,
+    stagedSlotReclaim };
+  } catch (error) {
+    // A blocked admission keeps its exact TRANSFER_STAGE_PENDING text (prefix untouched, release
+    // bindings never parsed from text) and additionally carries the structured stage block so the
+    // caller can show WHICH host and WHICH scope is stuck. Evidence gathering must never replace
+    // the original failure: any probe problem falls back to the untouched error.
+    if (stageBlockContext && /TRANSFER_STAGE_PENDING/.test(String(error && error.message || ""))) {
+      const lane = Number.isInteger(error && error.stagingLane) ? error.stagingLane : 0;
+      try {
+        await attachStagedStageBlock(error, { ...stageBlockContext, lane, identity: stageBlockContext.identities[lane],
+          incomingGeneration: stageBlockContext.generation });
+      } catch { /* the original error travels unchanged */ }
+    }
+    throw error;
   } finally { notification?.dispose?.(); }
 }
 
@@ -2644,7 +2906,9 @@ function writeLocalCodeSyncState(localPath, state) {
 function atomicWriteJsonIfMissing(targetPath, value) {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   if (fs.existsSync(targetPath)) return false;
-  const temp = `${targetPath}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  // One deterministic staging path: a crash can leave at most this single .writing sibling,
+  // which the next write overwrites in place — random temp names must never accumulate.
+  const temp = `${targetPath}.writing`;
   fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   fs.renameSync(temp, targetPath);
   return true;
@@ -3637,7 +3901,7 @@ function nextTransferId(operation) {
   return `transfer-${Date.now()}-${transferSequence}-${String(operation || "").replace(/[^\w.-]+/g, "-")}`;
 }
 
-function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true, readObserver = false, remoteMutation = false }) {
+function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true, readObserver = false, remoteMutation = false, maintenanceCleanup = false }) {
   const listeners = new Set();
   const progressListeners = new Set();
   let cancelled = false;
@@ -3764,8 +4028,10 @@ function createTransferController({ id, operation, localPath, remotePath, host, 
   const parentController = transferContext.getStore();
   const parentCancellation = parentController?.onCancel((reason) => controller.cancel(reason));
   // 只读观测身份在注册那一刻随控制器一起固定；未显式证明的控制器一律按可能写入处理。
+  // 维护豁免同样只在注册时固定，且必须与 remoteMutation 事实同时成立才在投影中生效。
   controller.readObserver = readObserver === true;
   controller.remoteMutation = remoteMutation === true;
+  controller.maintenanceCleanup = maintenanceCleanup === true;
   activeTransfers.set(controller.id, controller);
   if (parentController?.status === "cancelled") controller.cancel("上层操作已取消");
   return controller;
@@ -4234,9 +4500,26 @@ function createLocalApiMethods() {
     "files.cleanup.inspect": params => cleanupFileApi.inspect(params),
     "files.cleanup.observeBatch": params => cleanupFileApi.observeBatch(params),
     "files.cleanup.preview": params => cleanupFileApi.preview(params),
+    "files.cleanup.stagedSlots": async params => {
+      // params.generation (a stable incoming run id) turns this into an admission preview; without
+      // it the call is a pure read-only inventory that never lists the retained two generations.
+      // The remote-clock expiry verdict rides on the leaving candidate so a capable caller can
+      // distinguish an expired committed old generation from a retained one without guessing time.
+      const generation = params.generation ? transferScope64(params.generation) : undefined;
+      const identities = params.identity ? [String(params.identity)] : [0, 1].map(stagingLane =>
+        stagedLogicalKey(params.node?.root, [], { retentionKey: params.retentionKey, stagingLane }));
+      if (!params.identity && !String(params.retentionKey || "").trim()) cleanupFail("INVALID_REQUEST");
+      const expiry = stagedSlotExpirySettings();
+      const reports = await Promise.all(identities.map(identity => stagedSlotStaleReport(params.node, identity, generation, expiry.expiryMs)));
+      return { candidates: reports.flatMap(stagedSlotCleanupCandidates),
+        slots: reports.flatMap(report => Array.isArray(report.slots) ? report.slots : []),
+        held: reports.reduce((count, report) => count + report.held.length, 0), identities,
+        expiry: { enabled: expiry.enabled, ms: expiry.expiryMs } };
+    },
     "files.cleanup.confirm": params => cleanupFileApi.confirm(params),
     "files.cleanup.execute": params => cleanupFileApi.execute(params),
     "files.cleanup.status": params => cleanupFileApi.status(params),
+    "files.cleanup.isolatedMaintenanceDelete": params => cleanupFileApi.isolatedMaintenanceDelete(params),
     status: async () => {
       const active = getActiveSharedServer();
       return {
@@ -4247,6 +4530,8 @@ function createLocalApiMethods() {
         api: localApiServer
           ? { port: localApiServer.port, pid: localApiServer.startedAt ? process.pid : 0, startedAt: localApiServer.startedAt }
           : null,
+        // Real backend metadata so the unified CLI never has to guess the shared server file location.
+        serverConfigFile: SHARED_SERVER_FILE,
       };
     },
     "config.list": async () => {
@@ -4703,7 +4988,10 @@ function createLocalApiMethods() {
     methods[name] = async (params = {}) => {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
-      const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
+      // 隔离区后台删除是远端修改（只删已登记隔离副本，范围由引擎按登记约束），
+      // 它不获得 readObserver 只读身份；它对传输忙的豁免来自下面显式登记的维护事实。
+      const remoteMutation = name === "files.cleanup.isolatedMaintenanceDelete"
+        || /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
       const recoveryContext = name === "sync.serverToServerFpsync" || name === "upload.files" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
         ? { method: name, params: retryIdentity(params) } : undefined;
       // Metadata is a cancellable read, never a durable modifying transaction.
@@ -4735,7 +5023,9 @@ function createLocalApiMethods() {
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "",
         // No file operation is failed or killed because a filesystem call is slow.
         // Errors and explicit cancellation still settle through the original path.
-        observeOnlyIdle: true, readObserver, remoteMutation });
+        // 维护豁免事实由本路由按方法名固定登记（客户端参数无法伪装或删除执行不得自称）：
+        // 只有 files.cleanup.isolatedMaintenanceDelete 这一个入口的控制器携带它。
+        observeOnlyIdle: true, readObserver, remoteMutation, maintenanceCleanup: name === "files.cleanup.isolatedMaintenanceDelete" });
       controller.operationId = operationId;
       const requestContext = currentApiRequestContext();
       const readSignal = requestContext?.readOnly ? requestContext.signal : undefined;
@@ -4747,9 +5037,10 @@ function createLocalApiMethods() {
         const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
-        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch"].includes(name);
+        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch", "files.cleanup.stagedSlots"].includes(name);
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
-        const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
+        const maintenanceDelete = name === "files.cleanup.isolatedMaintenanceDelete";
+        const pool = maintenanceDelete ? maintenanceCleanupCapacity : cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
         const result = await transferContext.run(controller, () => withTransferCapacity(params, () => apiRouteController.run(controller, () => method(params)), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
@@ -5035,34 +5326,111 @@ function formatBytes(bytes) {
   return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+// r26: session records (plugin action/time/device/remote-path facts) WRITES land in the consuming
+// project's managed tree, same single-source pattern as upload-state; the old .vscode file stays a
+// READ-ONLY source, never migrated, rewritten or deleted, and no old project directories are ever
+// enumerated. One fixed file per project is overwritten with the current value — no per-session history.
+function projectSessionPath(localPath) {
+  return path.join(localPath, "simple_cluster", "state", "simple-sftp", "session.json");
+}
 function writeLocalSessionRecord(localPath, record) {
-  const vscodeDir = path.join(localPath, ".vscode");
-  fs.mkdirSync(vscodeDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(vscodeDir, "simple-sftp-session.json"),
-    `${JSON.stringify(record, null, 2)}\n`,
-    "utf8"
-  );
+  const file = projectSessionPath(localPath);
+  let current = path.join(localPath, "simple_cluster");
+  const segments = [current];
+  for (const part of ["state", "simple-sftp"]) { current = path.join(current, part); segments.push(current); }
+  ensureManagedSegmentsSync(segments);
+  fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+// r28: handoff markers are written to the remote project's managed state tree instead of the
+// remote root. The legacy root-level path stays a read-only source; a broken, empty or unusual
+// new marker never falls back to it, so a stale legacy handoff can never resurrect.
+const REMOTE_HANDOFF_MANAGED_SEGMENTS = ["simple_cluster", "state", "simple-sftp", "handoff"];
+
+function requireRemoteRoot(remotePath) {
+  const root = String(remotePath === undefined || remotePath === null ? "" : remotePath).replace(/\/+$/, "");
+  if (!root.startsWith("/")) {
+    throw new Error("远端项目根缺失或无效：必须是远端服务器上的 POSIX 绝对路径（不允许相对路径、空值或仅根目录），交接标记只能落在该项目的管理目录下。");
+  }
+  return root;
+}
+
+function safeHandoffMarkerName(markerName) {
+  const safeMarkerName = path.posix.basename(String(markerName || DEFAULT_HANDOFF_MARKER));
+  if (!safeMarkerName || safeMarkerName === "." || safeMarkerName === "..") {
+    throw new Error(`交接标记名称无效：${String(markerName)}`);
+  }
+  return safeMarkerName;
+}
+
+function getRemoteMarkerPath(remotePath, markerName) {
+  const root = requireRemoteRoot(remotePath);
+  return `${root}/${REMOTE_HANDOFF_MANAGED_SEGMENTS.join("/")}/${safeHandoffMarkerName(markerName)}`;
+}
+
+function legacyRemoteMarkerPath(remotePath, markerName) {
+  const root = requireRemoteRoot(remotePath);
+  return `${root}/${safeHandoffMarkerName(markerName)}`;
+}
+
+// r29: the sentinel is only trustworthy when the shell proved every parent step. A bare
+// `[ -e ]` on the marker returns false even under a parent that exists but is not searchable,
+// and a managed parent that is a symlink could read another project's marker. So the single
+// read-only command first proves the project root is a searchable directory, then walks each
+// managed parent: symlink, non-directory or non-searchable parents fail closed (exit 62/63/64
+// with stderr), and a missing parent under an already-proved searchable chain exits right away
+// with M. Only then may the marker itself emit U / R<payload> / M.
+function createRemoteHandoffReadCommand(root, markerPath) {
+  const steps = [`{ [ -d ${shellQuote(root)} ] && [ -x ${shellQuote(root)} ] || { printf %s 'remote root is not a searchable directory' >&2; exit 61; }; }`];
+  let parent = root;
+  for (const segment of REMOTE_HANDOFF_MANAGED_SEGMENTS) {
+    parent = `${parent}/${segment}`;
+    const quotedParent = shellQuote(parent);
+    steps.push(`{ if [ -L ${quotedParent} ]; then printf %s 'managed parent is a symlink' >&2; exit 62; fi; if [ -e ${quotedParent} ]; then [ -d ${quotedParent} ] || { printf %s 'managed parent is not a directory' >&2; exit 63; }; [ -x ${quotedParent} ] || { printf %s 'managed parent is not searchable' >&2; exit 64; }; else printf %s M; exit 0; fi; }`);
+  }
+  const quoted = shellQuote(markerPath);
+  // r30 ordinary-file contract: only a regular file may be cat'ed (an existing-but-not-regular
+  // marker such as a FIFO/device would block cat under a bare -e, a real regression against the
+  // old `-f` reader). Symlink/dir/FIFO/device all report U; a regular-but-unreadable marker keeps
+  // the real cat error; M is emitted only when the entry genuinely does not exist.
+  steps.push(`{ if [ -L ${quoted} ] || [ -d ${quoted} ]; then printf %s U; elif [ -f ${quoted} ]; then printf %s R; cat ${quoted}; elif [ -e ${quoted} ]; then printf %s U; else printf %s M; fi; }`);
+  return steps.join("; ");
 }
 
 async function readRemoteHandoffMarker(sftp, markerName) {
   const markerPath = getRemoteMarkerPath(sftp.remotePath, markerName);
-  const command = `if [ -f ${shellQuote(markerPath)} ]; then cat ${shellQuote(markerPath)}; fi`;
+  const command = createRemoteHandoffReadCommand(requireRemoteRoot(sftp.remotePath), markerPath);
   const stdout = await runSsh(sftp, command, 15000);
-  const text = stdout.trim();
-  return text ? JSON.parse(text) : null;
+  const text = String(stdout);
+  if (text === "M") {
+    const legacyPath = legacyRemoteMarkerPath(sftp.remotePath, markerName);
+    const legacyCommand = `if [ -f ${shellQuote(legacyPath)} ]; then cat ${shellQuote(legacyPath)}; fi`;
+    const legacyStdout = await runSsh(sftp, legacyCommand, 15000);
+    const legacyText = legacyStdout.trim();
+    return legacyText ? JSON.parse(legacyText) : null;
+  }
+  if (text === "U") throw new Error(`远端交接标记不可读（符号链接或目录），禁止读取旧路径内容：${markerPath}`);
+  if (text.startsWith("R")) {
+    const payload = text.slice(1).trim();
+    return payload ? JSON.parse(payload) : null;
+  }
+  throw new Error(`无法判定远端交接标记状态：${markerPath}`);
 }
 
 async function writeRemoteHandoffMarker(sftp, markerName, marker) {
   const markerPath = getRemoteMarkerPath(sftp.remotePath, markerName);
   const json = `${JSON.stringify(marker, null, 2)}\n`;
-  const command = `printf %s ${shellQuote(json)} > ${shellQuote(markerPath)}`;
+  const steps = [];
+  let managedPath = requireRemoteRoot(sftp.remotePath);
+  for (const segment of REMOTE_HANDOFF_MANAGED_SEGMENTS) {
+    managedPath = `${managedPath}/${segment}`;
+    const quotedDir = shellQuote(managedPath);
+    steps.push(`{ if [ -L ${quotedDir} ]; then exit 65; fi; mkdir -p -m 0700 ${quotedDir}; }`);
+  }
+  const quotedMarker = shellQuote(markerPath);
+  steps.push(`{ if [ -L ${quotedMarker} ]; then exit 66; fi; printf %s ${shellQuote(json)} > ${quotedMarker}; }`);
+  const command = steps.join(" && ");
   await withFileResourceLease("写入交接标记", sftp.remotePath, [markerPath], remoteResourceServer(sftp), () => runSsh(sftp, command, 15000));
-}
-
-function getRemoteMarkerPath(remotePath, markerName) {
-  const safeMarkerName = path.posix.basename(markerName || DEFAULT_HANDOFF_MARKER);
-  return `${String(remotePath).replace(/\/+$/, "")}/${safeMarkerName}`;
 }
 
 
@@ -5484,7 +5852,29 @@ function getUploadBaselineMs(localPath) {
   return now.getTime();
 }
 
+// r17-D: upload-state WRITES land in the project's managed tree; the old .vscode location stays
+// a READ-ONLY source (the new value always wins; the old file is never moved, rewritten or
+// deleted). A corrupt new file never falls back to the old timestamp — re-initializing is the
+// fail-closed reading of an unreadable own record.
+function ensureManagedSegmentsSync(roots) {
+  for (const dir of roots) {
+    try { fs.mkdirSync(dir, { mode: 0o700 }); }
+    catch (error) { if (error?.code !== "EEXIST") throw error; }
+    const stat = fs.lstatSync(dir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("项目受管目录不得为链接或非目录：" + dir);
+    // Windows st_mode carries no NTFS ACL semantics; the write-bit rule is POSIX-only.
+    if (process.platform !== "win32" && (stat.mode & 0o022) !== 0) throw new Error("项目受管目录允许组/其他用户写入：" + dir);
+  }
+}
+function projectUploadStatePath(localPath) {
+  return path.join(localPath, "simple_cluster", "state", "simple-sftp", "upload-state.json");
+}
 function readUploadState(localPath) {
+  const newPath = projectUploadStatePath(localPath);
+  if (fs.existsSync(newPath)) {
+    try { return JSON.parse(fs.readFileSync(newPath, "utf8")); }
+    catch { return null; }
+  }
   const statePath = path.join(localPath, ".vscode", SAVE_UPLOAD_STATE);
   if (!fs.existsSync(statePath)) return null;
   try {
@@ -5495,16 +5885,23 @@ function readUploadState(localPath) {
 }
 
 function writeUploadState(localPath, state) {
-  const vscodeDir = path.join(localPath, ".vscode");
-  fs.mkdirSync(vscodeDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(vscodeDir, SAVE_UPLOAD_STATE),
-    `${JSON.stringify(state, null, 2)}\n`,
-    "utf8"
-  );
+  const file = projectUploadStatePath(localPath);
+  let current = path.join(localPath, "simple_cluster");
+  const segments = [current];
+  for (const part of ["state", "simple-sftp"]) { current = path.join(current, part); segments.push(current); }
+  ensureManagedSegmentsSync(segments);
+  fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 function readLocalSessionRecord(localPath) {
+  // r26: the managed-tree record wins whenever it exists; a corrupt new record never resurrects the
+  // old .vscode value (fail-closed on our own unreadable record). Only a missing new file consults
+  // the exact legacy path, read-only.
+  const newPath = projectSessionPath(localPath);
+  if (fs.existsSync(newPath)) {
+    try { return JSON.parse(fs.readFileSync(newPath, "utf8")); }
+    catch { return null; }
+  }
   const sessionPath = path.join(localPath, ".vscode", "simple-sftp-session.json");
   if (!fs.existsSync(sessionPath)) return null;
   try {
@@ -6188,7 +6585,7 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
         if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) throw failExtract(`写入前本机目标不再是独占普通文件：${target.localRelativePath}`);
         if (!overwrite) throw failExtract(`本机文件已存在，未确认覆盖：${target.localRelativePath}`);
       }
-      const staging = mappedStagingPath(destination);
+      const staging = mappedStagingPath(root, destination);
       residuals.push(staging);
       const handle = openMappedStagingStream(staging);
       trackTransferResource(handle);
@@ -6253,9 +6650,28 @@ function cleanupMappedStagingFiles(root, paths) {
   return paths.filter(candidate => fs.existsSync(candidate));
 }
 
-function mappedStagingPath(destination) {
+// Local transfer staging lives inside the reserved project staging subtree: failed transfers no longer
+// scatter partial siblings through the workspace, and names stay deterministic per destination identity.
+function mappedStagingDirectory(root) {
+  const cluster = path.join(root, "simple_cluster");
+  let clusterInfo = null;
+  try { clusterInfo = fs.lstatSync(cluster); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (clusterInfo && (clusterInfo.isSymbolicLink() || !clusterInfo.isDirectory())) throw new Error("本机映射暂存容器不是普通目录：simple_cluster");
+  if (!clusterInfo) fs.mkdirSync(cluster, { recursive: true });
+  const base = path.join(cluster, ".simple-sftp-staging");
+  let baseInfo = null;
+  try { baseInfo = fs.lstatSync(base); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (!baseInfo) fs.mkdirSync(base, { recursive: true });
+  else if (baseInfo.isSymbolicLink() || !baseInfo.isDirectory()) throw new Error("本机映射暂存目录不是普通目录");
+  const realRoot = fs.realpathSync(root);
+  const realBase = fs.realpathSync(base);
+  const within = path.relative(realRoot, realBase);
+  if (!within || within === ".." || within.startsWith(`..${path.sep}`) || path.isAbsolute(within)) throw new Error("本机映射暂存目录会越出项目根目录，已停止。");
+  return realBase;
+}
+function mappedStagingPath(root, destination) {
   const identity = crypto.createHash("sha256").update(path.resolve(destination)).digest("hex").slice(0, 32);
-  return path.join(path.dirname(destination), `.${path.basename(destination)}.simple-sftp-partial-${identity}`);
+  return path.join(mappedStagingDirectory(root), `.${path.basename(destination)}.simple-sftp-partial-${identity}`);
 }
 
 function openMappedStagingStream(staging) {
@@ -6691,6 +7107,9 @@ function getTarExcludeArgs(ignorePatterns) {
   }
   addTarExcludePattern(excludes, ".vscode");
   addTarExcludePattern(excludes, DEFAULT_HANDOFF_MARKER);
+  // r28: the managed handoff tree lives under the remote root; a custom marker basename must
+  // never ride the plain root tar. simple_cluster/results and other kept prefixes are untouched.
+  addTarExcludePattern(excludes, "simple_cluster/state/simple-sftp");
   return Array.from(excludes).map((pattern) => `--exclude=${pattern}`);
 }
 
@@ -7064,6 +7483,15 @@ module.exports = {
     ensureMacTransferAuthentication,
     runLocalTarUploadCore,
     addTarExcludePattern,
+    // r17-D test hooks: upload-state moved into the project managed tree with the legacy
+    // .vscode file kept as a read-only source; tests pin the new/old precedence.
+    readUploadState, writeUploadState, projectUploadStatePath,
+    // r26: session records use the same managed-tree pattern; tests pin precedence and the
+    // getUploadBaselineMs priority chain (upload-state → session → initial) on top of it.
+    readLocalSessionRecord, writeLocalSessionRecord, projectSessionPath, getUploadBaselineMs,
+    // r28: remote handoff marker placement — pure path derivations for tests; read/write are
+    // exercised at source level with a scripted runSsh transport (workspaceIntegration pattern).
+    getRemoteMarkerPath, legacyRemoteMarkerPath,
     apiTransferSftp,
     createListRemoteDirsSshArgs,
     createRemoteExtractCommand,
@@ -7076,6 +7504,16 @@ module.exports = {
     downloadMappedPathsCore,
     setMappedDownloadTransport,
     extractMappedTarStream,
+    mappedStagingPath,
+    stagedSlotCleanupCandidates,
+    stagedSlotStaleReportCommand,
+    transferScope64,
+    attachStagedStageBlock,
+    stagedScope,
+    stagedSlotExpirySettings,
+    stagedSlotStageBlock,
+    reclaimExpiredStagedSlots,
+    STAGED_SLOT_DEFAULT_EXPIRY_MS,
     openMappedDownloadStream,
     directSyncTarget,
     directSyncRelativePath,
