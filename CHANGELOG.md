@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.104
+
+- Synced the shared staged-slot lifecycle from the Windows business authority: before a claim, only the oldest committed slot of the current identity/lane is reclaimed in place once its terminal age reaches the threshold (default one day, never configurable below it). The journal `terminalAt` is the accepted time source; unreadable, malformed, future or self-contradictory times count as not expired. Mac exposes the same two controls as `simpleSftpMac.autoReclaimExpiredCommittedSlots` and `simpleSftpMac.stagedSlotCommittedExpiryMs`; still no background or global scan and no new deletion entry point.
+- Synced the user-confirmed early release: `stagedJournal.requireExpired` separates automatic expiry from a single user confirmation, freezes into the preview ledger and digest preimage, and skips only the final age rule while the slot lock is held. Shape, identity, generation, committed status, per-field format, `terminalAt` monotonicity, the under-lock binding re-check and every corruption check stay in force, so an absent flag keeps the previous expiry behaviour exactly.
+- Synced the remaining shared semantics: transfer-busy snapshot projection, cleanup observe/isolate batch limits, busy fail-closed isolation with the isolation-completion receipt, background maintenance-delete admission, cleanup consumer-root binding, local staging containment and per-lane staging identity.
+- Handoff markers are now written to `simple_cluster/state/simple-sftp/handoff/` in the remote project; a legacy marker at the remote project root is read at most once only when the new location is genuinely absent, is never written, restored or transferred, and a damaged marker in the new location never falls back.
+- Mac identity is unchanged: `simple-local.simple-sftp-mac`, `simpleSftpMac.*` settings, `simple-sftp-mac-api`, Mac authentication, POSIX paths, update lease and Darwin handle evidence are retained. This batch was verified by source-level three-way merge and parse checks only; macOS runtime, M5 credentials and real transfers remain unverified.
+
 ## 0.2.61
 
 - Support verified exit reconciliation for abandoned projectInventory, projectTree and projectFileStats reads. Request identity, persisted read-only status, local owner/transport exit, and durable exit receipts are required; live requests and remote writers remain blocked.

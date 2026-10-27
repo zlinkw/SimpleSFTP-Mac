@@ -2,7 +2,7 @@
   "name": "simple-sftp-mac",
   "displayName": "SimpleSFTP Mac",
   "description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-  "version": "0.2.103",
+  "version": "0.2.104",
   "publisher": "simple-local",
   "extensionKind": [
     "ui"
@@ -223,6 +223,17 @@
           "type": "boolean",
           "default": true,
           "description": "上传和下载进度通知是否显示手动取消按钮。"
+        },
+        "simpleSftpMac.autoReclaimExpiredCommittedSlots": {
+          "type": "boolean",
+          "default": true,
+          "description": "Worker 同步在 claim 前就地回收本次身份已过期的最旧 committed 暂存槽（仅限本次 identity/lane，无后台扫描；journal 不完整、非终态、锁被持有或时间不可信一律不回收）。"
+        },
+        "simpleSftpMac.stagedSlotCommittedExpiryMs": {
+          "type": "integer",
+          "default": 86400000,
+          "minimum": 86400000,
+          "description": "committed 旧代暂存槽的自动过期阈值毫秒，默认 1 天；低于 1 天按 1 天处理（minimum 即 1 天），未满 1 天的候选提前释放只能走精确预览＋一次确认的专用入口。"
         }
       }
     }

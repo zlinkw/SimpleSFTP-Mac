@@ -176,7 +176,10 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
       archive.end();
     });
     fs.mkdirSync(extract);
-    await execFileAsync("tar", ["-xf", path.join(root, "workspace.tar"), "-C", extract], { timeout: 10000, windowsHide: true });
+    // Mac 适配：Windows 自带 bsdtar 会把绝对盘符路径当成远程主机（报 Cannot connect to C: resolve failed），
+    // 这里加 --force-local 强制按本地文件解析；仍然用外部 tar 解包校验归档内容，断言强度不变。
+    const unpackArgs = (process.platform === "win32" ? ["--force-local"] : []).concat(["-xf", path.join(root, "workspace.tar"), "-C", extract]);
+    await execFileAsync("tar", unpackArgs, { timeout: 10000, windowsHide: true });
     assert.equal(fs.readFileSync(path.join(extract, unicodeRelative), "utf8"), "中文内容\n");
     assert.equal(fs.readFileSync(path.join(extract, longRelative), "utf8"), "ok\n");
     assert.equal(transferredBytes, Buffer.byteLength("中文内容\n") + Buffer.byteLength("ok\n"));

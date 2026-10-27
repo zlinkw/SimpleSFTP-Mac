@@ -203,7 +203,7 @@ test('真实 CleanupFileApi 守卫经真实 API 封套抵达调用方，零租�
       req.on('error', reject); req.end(body);
     });
     const refused = await request({ jsonrpc: '2.0', id: 1, method: 'files.cleanup.preview',
-      params: { node: { kind: 'remote', root: '/mnt/nwpu3/zlk/MultiModal', host: 'h', port: 22, user: 'u' }, action: 'isolate',
+      params: { consumerRoot: require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-')), node: { kind: 'remote', root: '/mnt/nwpu3/zlk/MultiModal', host: 'h', port: 22, user: 'u' }, action: 'isolate',
         targets: [{ relativePath: 'work/job0', type: 'directory', destination: 'clean_dir/work/job0' }] } });
     assert.equal(refused.error.data.code, 'ACTIVE_TRANSFER');
     assert.equal(refused.error.code, 2010);
@@ -245,6 +245,36 @@ test('终态判定按 status 原值：类型异常表全部 fail-closed，与 0.
     assert.ok(!['completed', 'failed', 'cancelled'].includes(reported), label + '：异常类型不得被文本化成终态，实际=' + String(reported));
   }
 });
+test('维护事实：真实生产投影仅豁免登记过的隔离区维护行，真实写入仍计忙，证据行只在事实成立时携带标记', async () => {
+  const maintenance = { id: 'm1', status: 'running', operation: 'files.cleanup.isolatedMaintenanceDelete', remoteMutation: true, maintenanceCleanup: true };
+  const guard = productionGuard({ activeTransfers: new Map([['m1', maintenance]]), activeUploadOperations: new Map(), uploadQueues: new Map() });
+  await guard.activity();
+  const snapshot = guard.currentTransferBusySnapshot();
+  assert.equal(snapshot.busy, false, '仅维护删除在途时清理准入必须放行');
+  assert.equal(snapshot.activeTransferCount, 1, '维护那一条必须原样保留为事实');
+  assert.equal(snapshot.blockingTransferCount, 0);
+  assert.equal(snapshot.maintenanceTransferCount, 1);
+  assert.deepEqual(snapshot.activeTransfers[0], { id: 'm1', status: 'running', operation: 'files.cleanup.isolatedMaintenanceDelete',
+    readOnlyObserver: false, selfAttempt: false, maintenanceCleanup: true }, '证据行只在维护事实成立时多出这一个布尔键');
+  const mixed = productionGuard({ activeTransfers: new Map([['m1', maintenance],
+    ['u1', { id: 'u1', status: 'running', operation: 'upload.files', remoteMutation: true }]]), activeUploadOperations: new Map(), uploadQueues: new Map() });
+  const error = await mixed.activity().then(() => null, reason => reason);
+  assert.equal(error.code, 'ACTIVE_TRANSFER', '真实上传与维护行同在时必须仍被拦下');
+  assert.equal(error.apiData.busy.blockingTransferCount, 1, '阻断计数只点名真实上传');
+  assert.equal(error.apiData.busy.maintenanceTransferCount, 1);
+  assert.deepEqual(error.apiData.busy.activeTransfers.map(row => Boolean(row.maintenanceCleanup)), [true, false],
+    '非维护行的证据形状保持不变，不得多出任何键');
+  for (const [label, row] of [
+    ['缺维护标记', { id: 'x', status: 'running', operation: 'files.cleanup.isolatedMaintenanceDelete', remoteMutation: true }],
+    ['标记非布尔', { id: 'x', status: 'running', operation: 'files.cleanup.isolatedMaintenanceDelete', remoteMutation: true, maintenanceCleanup: 'yes' }],
+    ['缺远端变更事实', { id: 'x', status: 'running', remoteMutation: false, maintenanceCleanup: true }],
+    ['同时声明只读观测的自相矛盾行', { id: 'x', status: 'running', readObserver: true, remoteMutation: true, maintenanceCleanup: true }],
+  ]) {
+    const g = productionGuard({ activeTransfers: new Map([['x', row]]), activeUploadOperations: new Map(), uploadQueues: new Map() });
+    await assert.rejects(g.activity(), reason => reason.code === 'ACTIVE_TRANSFER' && reason.apiData.busy.maintenanceTransferCount === 0, label);
+  }
+});
+
 test('toString 抛异常的行与队列键仍按原值计忙并原样以 ACTIVE_TRANSFER 拒绝，不换成其它错误码', async () => {
   const boom = { toString() { throw new Error('hostile toString'); } };
   const guard = productionGuard({ activeTransfers: new Map([['t1', { id: boom, status: boom }]]), activeUploadOperations: new Map(),

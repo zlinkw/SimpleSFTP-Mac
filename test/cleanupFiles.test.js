@@ -1,4 +1,5 @@
 const test=require('node:test');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
@@ -28,8 +29,8 @@ test('file API receipt observation starts no mutation, journal or lease and adve
   const base=root(),node={id:'local',kind:'local',root:base},requests=[];
   const api=new CleanupFileApi({storageRoot:path.join(base,'state'),activity:async()=>{},lease:()=>assert.fail('readonly check cannot lease a mutation'),
     transport:async request=>{requests.push(request);return {ok:true,rootIdentity:{path:base},...(request.action==='check'?{state:'pending'}:{target:{absolutePath:base+'/output/a.csv',fingerprint:'fp',contentFingerprint:'fp'}})}}});
-  const p=await api.preview({node,targets:[{relativePath:'output/a.csv',type:'file',destination:'clean_dir/output/a.csv'}]});assert.equal(p.safety.readOnlyReceiptCheck,true);
-  assert.equal((await api.check({token:p.token,index:0})).state,'pending');assert.ok(requests.every(request=>['inspect','check'].includes(request.action)));assert.equal(fs.existsSync(path.join(base,'state')),false);
+  const p=await api.preview({consumerRoot: __CONSUMER__, node,targets:[{relativePath:'output/a.csv',type:'file',destination:'clean_dir/output/a.csv'}]});assert.equal(p.safety.readOnlyReceiptCheck,true);
+  assert.equal((await api.check({consumerRoot: __CONSUMER__, token:p.token,index:0})).state,'pending');assert.ok(requests.every(request=>['inspect','check'].includes(request.action)));assert.equal(fs.existsSync(path.join(base,'state')),false);
   const source=fs.readFileSync(require.resolve('../extension.js'),'utf8'),server=fs.readFileSync(require.resolve('../api-server.js'),'utf8');
   assert.match(source,/"files.cleanup.check": \{ readOnly: true, zeroWrites: true/);assert.ok(server.includes('"files.cleanup.check", "files.cleanup.preview"'));
 });
@@ -114,29 +115,29 @@ test('file API confirmations are immutable, persisted, separate and never use re
     if(request.action==='inspect')return {ok:true,rootIdentity:{path:base},target:{fingerprint:changed?'B':'A',contentFingerprint:'A',absolutePath:path.join(base,'job/a'),inode:'1'}};
     mutations++;return {ok:true,receipt:{phase:'completed'}};
   }});
-  const p=await api.preview({node,action:'delete',targets:[target]});assert.equal(fs.existsSync(path.join(base,'journal')),false);
-  await assert.rejects(api.preview({node,targets:[{...target,destination:'models/replacement'}]}),/UNSAFE_DESTINATION/);
-  await assert.rejects(api.execute({token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
-  await api.confirm({token:p.token,digest:p.digest,confirm:true,phase:1,exactTargets:p.targets.map(t=>t.absolutePath)});
-  await assert.rejects(api.execute({token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
-  await assert.rejects(api.confirm({token:p.token,digest:p.digest,confirm:true,phase:2,exactTargets:['/other']}),/CONFIRM_REQUIRED/);
-  await api.confirm({token:p.token,digest:p.digest,confirm:true,phase:2,exactTargets:p.targets.map(t=>t.absolutePath)});changed=true;
-  await assert.rejects(api.execute({token:p.token,digest:p.digest,index:0}),/PREVIEW_CHANGED/);assert.equal(mutations,0);
+  const p=await api.preview({consumerRoot: __CONSUMER__, node,action:'delete',targets:[target]});assert.equal(fs.existsSync(path.join(base,'journal')),false);
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node,targets:[{...target,destination:'models/replacement'}]}),/UNSAFE_DESTINATION/);
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
+  await api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,confirm:true,phase:1,exactTargets:p.targets.map(t=>t.absolutePath)});
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
+  await assert.rejects(api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,confirm:true,phase:2,exactTargets:['/other']}),/CONFIRM_REQUIRED/);
+  await api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,confirm:true,phase:2,exactTargets:p.targets.map(t=>t.absolutePath)});changed=true;
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0}),/PREVIEW_CHANGED/);assert.equal(mutations,0);
 });
 test('activity and audit/permission errors stop without a successful receipt',async()=>{
   const base=root();let mutated=0;
   const active=new CleanupFileApi({storageRoot:base,transport:async()=>{mutated++},activity:async()=>{throw new Error('ACTIVE_TRANSFER')},lease:async(n,t,w)=>w()});
-  await assert.rejects(active.preview({node:{root:base},targets:[{type:'file',relativePath:'output/a',destination:'clean_dir/output/a'}]}),/ACTIVE_TRANSFER/);assert.equal(mutated,0);
+  await assert.rejects(active.preview({consumerRoot: __CONSUMER__, node:{root:base},targets:[{type:'file',relativePath:'output/a',destination:'clean_dir/output/a'}]}),/ACTIVE_TRANSFER/);assert.equal(mutated,0);
   const denied=new CleanupFileApi({storageRoot:base,transport:async()=>({ok:false,error:{code:'PERMISSION_DENIED'}}),activity:async()=>{},lease:async(n,t,w)=>w()});
-  await assert.rejects(denied.preview({node:{root:base},targets:[{type:'file',relativePath:'output/a',destination:'clean_dir/output/a'}]}),/PERMISSION_DENIED/);
+  await assert.rejects(denied.preview({consumerRoot: __CONSUMER__, node:{root:base},targets:[{type:'file',relativePath:'output/a',destination:'clean_dir/output/a'}]}),/PERMISSION_DENIED/);
 });
 test('verified absent targets never grant authority to a later recreated file',async()=>{
   const base=root(),node={id:'local',kind:'local',root:base};write(base,'output/present.csv');
   const api=new CleanupFileApi({storageRoot:path.join(base,'state'),transport:async r=>run(r),activity:async()=>{},lease:async(n,t,w)=>w()});
-  const p=await api.preview({node,targets:[{relativePath:'output/present.csv',destination:'clean_dir/output/present.csv',type:'file'},{relativePath:'output/absent.csv',destination:'clean_dir/output/absent.csv',type:'file'}]});
-  assert.deepEqual(p.states,['pending','absent']);await api.confirm({token:p.token,digest:p.digest,confirm:true,phase:1,exactTargets:p.targets.filter(t=>!t.missing).map(t=>t.absolutePath)});
-  write(base,'output/absent.csv','new job');await assert.rejects(api.execute({token:p.token,digest:p.digest,index:0}),/PREVIEW_CHANGED/);
-  await assert.rejects(api.execute({token:p.token,digest:p.digest,index:1}),/NOT_AN_EXECUTABLE_TARGET/);assert.ok(fs.existsSync(path.join(base,'output/present.csv')));
+  const p=await api.preview({consumerRoot: __CONSUMER__, node,targets:[{relativePath:'output/present.csv',destination:'clean_dir/output/present.csv',type:'file'},{relativePath:'output/absent.csv',destination:'clean_dir/output/absent.csv',type:'file'}]});
+  assert.deepEqual(p.states,['pending','absent']);await api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,confirm:true,phase:1,exactTargets:p.targets.filter(t=>!t.missing).map(t=>t.absolutePath)});
+  write(base,'output/absent.csv','new job');await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0}),/PREVIEW_CHANGED/);
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:1}),/NOT_AN_EXECUTABLE_TARGET/);assert.ok(fs.existsSync(path.join(base,'output/present.csv')));
 });
 test('lost move response settles through the receipt and never repeats the mutation; audit excludes tokens',async()=>{
   const base=root(),node={id:'local',kind:'local',root:base};let mutations=0;
@@ -146,9 +147,9 @@ test('lost move response settles through the receipt and never repeats the mutat
     if(r.action==='settle')return {ok:true,receipt:{phase:'completed',contentFingerprint:'f'}};
     throw new Error(r.action);
   }});
-  const p=await api.preview({node,targets:[{relativePath:'a',destination:'clean_dir/a',type:'file'}]});await api.confirm({token:p.token,digest:p.digest,confirm:true,phase:1,exactTargets:p.targets.map(t=>t.absolutePath)});
-  await assert.rejects(api.execute({token:p.token,digest:p.digest,index:0}),/lost response/);
-  const result=await api.execute({token:p.token,digest:p.digest,index:0});assert.equal(result.settled,true);assert.equal(mutations,1);
+  const p=await api.preview({consumerRoot: __CONSUMER__, node,targets:[{relativePath:'a',destination:'clean_dir/a',type:'file'}]});await api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,confirm:true,phase:1,exactTargets:p.targets.map(t=>t.absolutePath)});
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0}),/lost response/);
+  const result=await api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0});assert.equal(result.settled,true);assert.equal(mutations,1);
 });
 test('receipt-only settlement cannot launch a move and refuses an uncertain deletion receipt',async()=>{
   const base=root(),node={id:'local',kind:'local',root:base};let moves=0;
@@ -158,12 +159,12 @@ test('receipt-only settlement cannot launch a move and refuses an uncertain dele
     if(request.action==='settle')return {ok:true,receipt:{contentFingerprint:'f'}};
     throw Error(request.action);
   }});
-  const params={node,targets:[{relativePath:'output/a',destination:'clean_dir/output/a',type:'file'}]},p=await api.preview(params),approved={token:p.token,digest:p.digest,index:0};
-  await api.confirm({...approved,phase:1,confirm:true,exactTargets:p.targets.map(row=>row.absolutePath)});
+  const params={consumerRoot:__CONSUMER__,node,targets:[{relativePath:'output/a',destination:'clean_dir/output/a',type:'file'}]},p=await api.preview(params),approved={token:p.token,digest:p.digest,index:0,consumerRoot:__CONSUMER__};
+  await api.confirm({consumerRoot: __CONSUMER__, ...approved,phase:1,confirm:true,exactTargets:p.targets.map(row=>row.absolutePath)});
   assert.equal((await api.settle(approved)).state,'pending');assert.equal(moves,0);
   await assert.rejects(api.execute(approved),/lost/);assert.equal((await api.settle(approved)).state,'completed');assert.equal(moves,1);
-  const deletion=await api.preview({...params,action:'delete'});for(const phase of [1,2])await api.confirm({token:deletion.token,digest:deletion.digest,phase,confirm:true,exactTargets:deletion.targets.map(row=>row.absolutePath)});
-  await assert.rejects(api.settle({token:deletion.token,digest:deletion.digest,index:0}),/DELETE_RECEIPT_UNCERTAIN/);
+  const deletion=await api.preview({consumerRoot: __CONSUMER__, ...params,action:'delete'});for(const phase of [1,2])await api.confirm({consumerRoot: __CONSUMER__, token:deletion.token,digest:deletion.digest,phase,confirm:true,exactTargets:deletion.targets.map(row=>row.absolutePath)});
+  await assert.rejects(api.settle({consumerRoot: __CONSUMER__, token:deletion.token,digest:deletion.digest,index:0}),/DELETE_RECEIPT_UNCERTAIN/);
 });
 test('directory deletion freezes child types and names; audit permission failure stops before moving (all deletions mocked)',()=>{
   const base=root();write(base,'output/dir/sub/a.csv');

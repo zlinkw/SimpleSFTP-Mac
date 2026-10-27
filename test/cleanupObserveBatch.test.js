@@ -1,4 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const {spawnSync}=require('node:child_process');
 const os=require('node:os');
 // v1.10 contract tests for the public read-only recovery round
@@ -53,6 +54,9 @@ function harness(options={}){
           capabilities:{batchCleanupObservation:1,maxTargets:5000},observations:rows,metrics:{}};
       } finally{ stats.active--; stats.per[round] -= 1; }
     }
+    if(request.action==='inspect')
+      return {ok:true,rootIdentity:IDENTITY,target:{type:request.target.type,absolutePath:'/srv/proj/'+request.target.relativePath,
+        fingerprint:'top-'+request.target.relativePath,device:'7',inode:'2'+request.target.relativePath,fingerprintMode:'top_level',inventory:[]}};
     throw Object.assign(Error('UNEXPECTED_ACTION'),{code:'UNEXPECTED_ACTION'});
   };
   const storageRoot=fs.mkdtempSync(path.join(os.tmpdir(),'observe-batch-'));
@@ -62,13 +66,13 @@ function harness(options={}){
 const dirs=n=>Array.from({length:n},(_,i)=>({relativePath:'out/d'+i,type:'directory'}));
 const residue=n=>dirs(n).map((t,i)=>({key:'k'+i,...t,isolationRelativePath:'out/iso_d'+i}));
 async function confirmed(api,targets){
-  const row=await api.preview({node:NODE,action:'delete',authorizationMode:'confirmed_paths',targets});
+  const row=await api.preview({consumerRoot: __CONSUMER__, node:NODE,action:'delete',authorizationMode:'confirmed_paths',targets});
   const exact=row.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
-  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
-  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
   return row;
 }
-const observe=(api,targets,options={})=>api.observeBatch({node:options.node||NODE,observationId:options.observationId||'round-1',
+const observe=(api,targets,options={})=>api.observeBatch({consumerRoot: __CONSUMER__, node:options.node||NODE,observationId:options.observationId||'round-1',
   readConcurrency:options.readConcurrency??2,...(options.rootIdentity===undefined?{}:{rootIdentity:options.rootIdentity}),targets});
 
 test('one round answers 1200 residue dirs in ONE expanded batch with the contract echo',async()=>{
@@ -153,7 +157,7 @@ test('backend tokens bind to the frozen target, node and root, and carry frozen 
   assert.equal(byKey.b.error.code,'TOKEN_TARGET_MISMATCH','an isolation claim the row contradicts is refused, not probed');
   assert.equal(byKey.b.state,'unknown');
   assert.equal(byKey.x.error.code,'TOKEN_TARGET_MISMATCH');
-  assert.equal(byKey.u.error.code,'TOKEN_UNAVAILABLE');
+  assert.equal(byKey.u.error.code,'LEGACY_IMPORT_UNBOUND','a cold token with no frozen digest reference stops at the owner contract; it never borrows facts');
   assert.ok(!seen.some(e=>['b','x','u'].includes(e.key)),'refused targets never ride the wire with wrong facts');
   // same token, different node / different root: refused per target
   const cross=await observe(api,[{key:'a',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:0}],
@@ -211,7 +215,9 @@ test('missing, duplicated, reordered and failed answers stay explicit unknowns a
   const res3=await observe(failed.api,residue(3000)); // expanded 6000 -> [5000,1000], second batch dies
   assert.equal(res3.observations.filter(o=>o.error&&o.error.code==='OBSERVE_ROUND_FAILED').length,500);
   assert.equal(res3.observations.filter(o=>o.status==='present').length,2500,'the surviving batch keeps its facts');
-  assert.ok(res3.observations.every(o=>o.state===undefined&&o.status!=='gone'),'a failed batch never writes anything off');
+  // 0.2.111 契约变更（经裁决）：非应答行由隐式缺字段改为显式 state:'unknown'（unknown≠完成）；
+  // 无台账行的存活应答仍按 :92「no token means no claimed state」不声明 state。
+  assert.ok(res3.observations.every(o=>((o.error&&o.error.code==='OBSERVE_ROUND_FAILED')?o.state==='unknown':o.state===undefined)&&o.status!=='gone'),'a failed batch never writes anything off');
 
   const drift=harness({identityDrift:true});
   const res4=await observe(drift.api,residue(2));
@@ -244,10 +250,10 @@ test('a token frozen under a stable worker id never answers for another worker i
     target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true,
     ...(e.isolationRelativePath?{isolationStatus:'gone',isolationChecked:true}:{})})});
   const W1={id:'w1',kind:'remote',root:'/srv/proj',host:'h',user:'u',port:22};
-  const row=await api.preview({node:W1,action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'out/d0',type:'directory'}]});
+  const row=await api.preview({consumerRoot: __CONSUMER__, node:W1,action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'out/d0',type:'directory'}]});
   const exact=row.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
-  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
-  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
   const tokenTarget=[{key:'a',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:0}];
   const before=calls.length;
   const cross=await observe(api,tokenTarget,{node:{...W1,id:'w2'}});
@@ -260,11 +266,11 @@ test('a token frozen under a stable worker id never answers for another worker i
   // sync-scope compatibility: a side without any id keeps the field-only match.
   const halfA=await observe(api,tokenTarget,{node:{kind:'remote',root:'/srv/proj',host:'h',user:'u',port:22}});
   assert.equal(halfA.observations[0].error,undefined,'an id-free observer stays compatible with an id-frozen row');
-  const anon=await api.preview({node:{kind:'remote',root:'/srv/proj',host:'h2',user:'u',port:22},action:'delete',
+  const anon=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/srv/proj',host:'h2',user:'u',port:22},action:'delete',
     authorizationMode:'confirmed_paths',targets:[{relativePath:'out/d1',type:'directory'}]});
   const anonExact=anon.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
-  await api.confirm({token:anon.token,digest:anon.digest,confirm:true,phase:1,exactTargets:anonExact});
-  await api.confirm({token:anon.token,digest:anon.digest,confirm:true,phase:2,exactTargets:anonExact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:anon.token,digest:anon.digest,confirm:true,phase:1,exactTargets:anonExact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:anon.token,digest:anon.digest,confirm:true,phase:2,exactTargets:anonExact});
   const halfB=await observe(api,[{key:'b',relativePath:'out/d1',type:'directory',backendToken:anon.token,backendIndex:0}],
     {node:{id:'w9',kind:'remote',root:'/srv/proj',host:'h2',user:'u',port:22}});
   assert.equal(halfB.observations[0].error,undefined,'an id-free frozen row stays compatible with an id-carrying observer');
@@ -292,8 +298,8 @@ test('the instance read budget is two slots shared across requests, and failed r
   // P2b: two readConcurrency=2 rounds still stack to at most two global slots.
   const shared=harness({delay:true});
   const [p,q]=await Promise.all([
-    shared.api.observeBatch({node:NODE,observationId:'p',readConcurrency:2,targets:residue(3000).map(t=>({...t,key:'p'+t.key}))}),
-    shared.api.observeBatch({node:NODE,observationId:'q',readConcurrency:2,targets:residue(3000).map(t=>({...t,key:'q'+t.key}))}),
+    shared.api.observeBatch({consumerRoot: __CONSUMER__, node:NODE,observationId:'p',readConcurrency:2,targets:residue(3000).map(t=>({...t,key:'p'+t.key}))}),
+    shared.api.observeBatch({consumerRoot: __CONSUMER__, node:NODE,observationId:'q',readConcurrency:2,targets:residue(3000).map(t=>({...t,key:'q'+t.key}))}),
   ]);
   assert.equal(shared.stats.peak,2,'rc=2 rounds share exactly two slots');
   assert.equal(stats.perPeak.p,undefined);
@@ -302,11 +308,11 @@ test('the instance read budget is two slots shared across requests, and failed r
 });
 
 async function tokenRow(api,rels,node=NODE){
-  const row=await api.preview({node,action:'delete',authorizationMode:'confirmed_paths',
+  const row=await api.preview({consumerRoot: __CONSUMER__, node,action:'delete',authorizationMode:'confirmed_paths',
     targets:rels.map(rel=>({relativePath:rel,type:'file'}))});
   const exact=row.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
-  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
-  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
+  await api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
   return row;
 }
 const DEATH='f'.repeat(48);
@@ -320,7 +326,7 @@ test('one observeBatch call reads each backend token exactly once and re-reads a
     target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true})});
   const reads={n:0};
   const realRead=api.read.bind(api);
-  api.read=async token=>{ reads.n+=1; return realRead(token); };
+  api.read=async (token,consumerRoot,expectedDigest)=>{ reads.n+=1; return realRead(token,consumerRoot,expectedDigest); };
   const one=await tokenRow(api,['out/a0','out/a1','out/a2']);
   const three=await tokenRow(api,['out/b0','out/b1','out/b2','out/b3']);
   const mine=(row,rels,from=0)=>rels.map((rel,i)=>({key:'k'+from+i,relativePath:rel,type:'file',backendToken:row.token,backendIndex:i}));
@@ -332,7 +338,7 @@ test('one observeBatch call reads each backend token exactly once and re-reads a
   reads.n=0;
   const second=await observe(api,[...mine(one,['out/a0','out/a1','out/a2']),...dead]);
   assert.equal(reads.n,2,'the same token is re-read next call, and the dead token costs one deduplicated read');
-  assert.equal(Object.values(second.observations).filter(o=>o.error&&o.error.code==='TOKEN_UNAVAILABLE').length,3);
+  assert.equal(Object.values(second.observations).filter(o=>o.error&&['LEGACY_IMPORT_UNBOUND','TOKEN_UNAVAILABLE'].includes(o.error.code)).length,3,'dead rows stop at the owner contract (first read honest stop code, deduped followers unavailable), never contaminating live rows');
   assert.ok(second.observations.find(o=>o.key==='k00').state==='completed','the dead token never contaminates live rows');
   reads.n=0;
   const half=await observe(api,[...mine(one,['out/a0','out/a1','out/a2'],0).slice(0,2),{key:'dup',relativePath:'out/zz',type:'file',backendToken:one.token,backendIndex:9}]);
@@ -353,17 +359,17 @@ test('default-heap scale: 1200 and 5000 real-token rows stay linear, fresh, and 
     target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true})});
   const reads={n:0,hitsDisk:false};
   const realRead=api.read.bind(api);
-  api.read=async token=>{ reads.n+=1;
+  api.read=async (token,consumerRoot,expectedDigest)=>{ reads.n+=1;
     // prove the cold round really goes to disk: preview cache cleared means
     // read() takes its fs branch (production behaviour, observed only)
     if(!api.previews.has(token))reads.hitsDisk=true;
-    return realRead(token); };
+    return realRead(token,consumerRoot,expectedDigest); };
   const rels=n=>Array.from({length:n},(_,i)=>'out/f'+String(i).padStart(5,'0'));
   const clock=()=>Number(process.hrtime.bigint())/1e6;
   const report={};
   for(const n of [1200,5000]){
     const row=await tokenRow(api,rels(n));
-    const file=path.join(api.storageRoot,row.token+'.json');
+    const file=path.join(__CONSUMER__,'simple_cluster','state','simple-sftp','cleanup-operations',row.token+'.json');
     const bytesBefore=fs.readFileSync(file);
     const targets=rels(n).map((rel,i)=>({key:'k'+i,relativePath:rel,type:'file',backendToken:row.token,backendIndex:i}));
     reads.n=0;reads.hitsDisk=false;
@@ -410,7 +416,7 @@ test('default-heap scale: 1200 and 5000 real-token rows stay linear, fresh, and 
   const mixedRound=await observe(api,mixed,{readConcurrency:1});
   assert.equal(reads.n,3,'per-token accounting: two live tokens plus one dead token, one read each');
   assert.equal(Object.values(mixedRound.observations).filter(o=>o.state==='completed').length,1200,'the dead token never contaminates live groups');
-  assert.equal(Object.values(mixedRound.observations).filter(o=>o.error&&o.error.code==='TOKEN_UNAVAILABLE').length,400);
+  assert.equal(Object.values(mixedRound.observations).filter(o=>o.error&&['LEGACY_IMPORT_UNBOUND','TOKEN_UNAVAILABLE'].includes(o.error.code)).length,400,'the dead token stops at the owner contract, deduplicated');
   // Measurement ships as test diagnostics (captured by the investigation
   // script into scratch); the suite never depends on a fixed report path.
   t.diagnostic('SCALE-MEASUREMENT '+JSON.stringify(report));
@@ -443,6 +449,69 @@ test('malformed observation requests are refused before anything touches the wir
   ];
   for(const params of bad)await assert.rejects(api.observeBatch(params),/INVALID_REQUEST|PROTECTED_PATH|UNSAFE_DESTINATION/);
   assert.equal(calls.filter(c=>c.action==='batch-observe').length,0);
+});
+test('an isolate token observed through its registered destination answers the deletion lifecycle honestly',async()=>{
+  // 0.2.111: the background delete registers row.isolatedDelete; observation of
+  // the REGISTERED destination path is then bound by the frozen ledger row.
+  // Completion needs BOTH facts: the ledger lifecycle completed AND the absent
+  // destination. Accepted/executing/unknown + gone never complete; anything
+  // else is an explicit unknown; the SOURCE-path derivation stays untouched.
+  const BATCH='job-'+'a'.repeat(48),dest=JOB+'/out/run1';
+  async function isolateRow(options){
+    const h=harness(options);
+    const row=await h.api.preview({consumerRoot: __CONSUMER__, node:NODE,action:'isolate',
+      targets:[{relativePath:'out/run1',type:'directory',archiveBatch:BATCH,destination:dest}]});
+    await h.api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:['/srv/proj/out/run1']});
+    const stored=await h.api.read(row.token, __CONSUMER__);
+    stored.states[0]='completed';
+    stored.receipts={[0]:{phase:'completed',isolationCompletionProtocol:1,renameCommitted:true,sourceMissingAtMove:true,registered:true,executorsChecked:true,executors:[]}};
+    await h.api.save(stored);
+    return {h,row,async phase(phase){const s=await h.api.read(row.token, __CONSUMER__);
+      if(phase===undefined)delete s.isolatedDelete;
+      else s.isolatedDelete={capability:'isolationBackgroundDelete',protocol:1,phase,operationId:s.operationId,
+        targets:[{destinationRelativePath:dest,type:'directory'}]};
+      await h.api.save(s);}};
+  }
+  const destTarget=token=>[{key:'g',relativePath:dest,type:'directory',backendToken:token,backendIndex:0}];
+  const sourceTarget=token=>[{key:'s',relativePath:'out/run1',type:'directory',backendToken:token,backendIndex:0}];
+  const statusOf=st=>e=>({key:e.key,status:st,
+    target:{missing:st==='gone',type:e.type,absolutePath:'/srv/proj/'+e.relativePath,device:'7',inode:'9'+e.relativePath},
+    executors:[],executorsChecked:true});
+  const t0=await isolateRow({observe:statusOf('gone')});
+  let res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].error.code,'TOKEN_TARGET_MISMATCH','before maintenance starts the token binds the source path only');
+  assert.equal(res.observations[0].state,'unknown');
+  await t0.phase('accepted');
+  res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].state,'unknown','an accepted delete with an absent destination is never worded completed');
+  await t0.phase('executing');
+  res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].state,'unknown','executing + gone stays unknown: the mutation answer may have been lost');
+  await t0.phase('completed');
+  res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].state,'completed','completion needs the ledger phase AND the absent destination together');
+  const t1=await isolateRow({observe:statusOf('present')});
+  await t1.phase('completed');
+  res=await observe(t1.h.api,destTarget(t1.row.token));
+  assert.equal(res.observations[0].state,'unknown','a destination standing again contradicts the ledger: unknown, never a new grant');
+  const t2=await isolateRow({observe:statusOf('present')});
+  await t2.phase('executing');
+  res=await observe(t2.h.api,destTarget(t2.row.token));
+  assert.equal(res.observations[0].state,'executing');
+  await t2.phase('accepted');
+  res=await observe(t2.h.api,destTarget(t2.row.token));
+  assert.equal(res.observations[0].state,'pending');
+  const t3=await isolateRow({observe:statusOf('gone'),dropRow:r=>r.key==='g'});
+  await t3.phase('completed');
+  res=await observe(t3.h.api,destTarget(t3.row.token));
+  assert.equal(res.observations[0].error.code,'ANSWER_MISSING');assert.equal(res.observations[0].state,'unknown','a missing answer never completes');
+  const t4=await isolateRow({observe:statusOf('present')});
+  const before=await observe(t4.h.api,sourceTarget(t4.row.token));
+  await t4.phase('executing');
+  const after=await observe(t4.h.api,sourceTarget(t4.row.token));
+  assert.equal(after.observations[0].state,before.observations[0].state,'the delete lifecycle never leaks into source-path derivation');
+  assert.ok(t3.h.calls.every(c=>['inspect','batch-inspect','batch-observe'].includes(c.action)),
+    'destination rows ride the shared read-only batch-observe round; no mutation action ever leaves this entry');
 });
 test('engine batch_observe answers from current facts with one shared sweep and zero mutation primitives (FakeOS fixture)',()=>{
   const fixture=path.resolve(__dirname,'cleanupObserveBatch.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');

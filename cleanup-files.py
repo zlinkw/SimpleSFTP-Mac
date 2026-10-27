@@ -1020,6 +1020,171 @@ def mutation_lock(root):
 # traversals hold only the exact isolation subtree chain. ---
 ARCHIVED_BATCH_RE = re.compile(r"^clean_dir/(job-[a-f0-9]{48})/(.+)$")
 
+# Staging two-generation slot layout owned by the pinned receiver (identity dir
+# d-<hex>, fixed slots 0/1, sibling <slot>.lock held non-blockingly by claim).
+STAGED_SLOT_REL_RE = re.compile(r"^simple_cluster/\.simple-sftp-staging/d-[0-9a-f]{8,64}/([01])$")
+
+
+def staged_slot_lock(root, target):
+    """Isolation-moment verification of one staged slot's lock.
+
+    A receiver claim holds <slot>.lock (flock LOCK_EX|LOCK_NB) across admission and
+    streaming, so a lock check done only at earlier preview time cannot prove the slot
+    is unheld AT the rename. An ABSENT lock file means no holder (claim creates the file
+    before locking and never removes it); a lock that is held, unopenable or whose
+    check capability is missing refuses the isolation — fail closed, never a weaker path.
+    The returned handle must stay open across the rename and is closed by the caller.
+    """
+    rel = str(target.get("relativePath") or "")
+    if not STAGED_SLOT_REL_RE.match(rel):
+        return None
+    parent_rel, leaf = rel.rsplit("/", 1)
+    leaf += ".lock"
+    parent_full = path_guard(root, parent_rel)
+    if os.name == "nt":
+        try:
+            stream = open(os.path.join(parent_full, leaf), "r+b")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            deny("SLOT_LOCK_UNCERTAIN", os.path.join(parent_full, leaf), "槽锁文件无法打开，拒绝隔离")
+        try:
+            import msvcrt
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            stream.close()
+            deny("SLOT_LOCK_HELD", os.path.join(parent_full, leaf), "槽锁被持有，拒绝隔离")
+        return stream
+    try:
+        parent_fd = os.open(parent_full, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        deny("SLOT_LOCK_UNCERTAIN", parent_full, "无法钉住槽锁所在目录，拒绝隔离")
+    # Same-source capability probe: the symbols checked here are EXACTLY the ones called below
+    # (fcntl.flock / fcntl.LOCK_EX / fcntl.LOCK_NB). Probing os.flock instead once misjudged the
+    # real WSL 3.12 interpreter — where os.flock is absent but fcntl.flock is the working,
+    # receiver-side lock — as "no verification capability" and failed every released isolate
+    # closed forever. A missing probe symbol still refuses: fail closed, never a weaker path.
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if not getattr(os, "O_NOFOLLOW", 0) or not hasattr(os, "O_DIRECTORY") \
+            or fcntl is None or not hasattr(fcntl, "flock") or not hasattr(fcntl, "LOCK_EX") or not hasattr(fcntl, "LOCK_NB"):
+        try:
+            os.close(parent_fd)
+        finally:
+            deny("SLOT_LOCK_UNCERTAIN", parent_full, "运行环境缺少槽锁核验能力，拒绝隔离")
+    try:
+        try:
+            fd = os.open(leaf, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            deny("SLOT_LOCK_UNCERTAIN", leaf, "槽锁文件无法打开，拒绝隔离")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            deny("SLOT_LOCK_HELD", leaf, "槽锁被持有，拒绝隔离")
+        return fd
+    finally:
+        os.close(parent_fd)
+
+
+def release_staged_slot_lock(handle):
+    if handle is None:
+        return
+    try:
+        handle.close() if not isinstance(handle, int) else os.close(handle)
+    except OSError:
+        pass
+
+
+def verify_staged_journal_binding(root, target, binding):
+    """P1-3 ruling: re-prove the expiry-reclaim eligibility against the CURRENT journal WHILE the
+    slot lock is held. A free lock only proves no receiver is streaming — it does NOT prove the
+    journal is still the committed, expired row the reclaim was authorized against; the same
+    generation may have resumed, changed or freshly re-committed after the report. Every missing,
+    corrupt, future, contradictory or simply different fact denies the rename; the earlier
+    committed/expired verdict is never trusted across that window.
+
+    0.2.114: requireExpired distinguishes WHO authorized the isolation. True (the default for every
+    0.2.113 caller, byte-for-byte) is the automatic expiry reclaim: the age threshold must still
+    hold. Exactly False is an explicitly user-confirmed early release frozen in the preview ledger:
+    ONLY the final age-threshold rule is skipped — every other under-lock check (shape, identity,
+    generation, committed status, per-field presence/format, exact terminalAt binding, future
+    timestamp, createdAt contradiction, unreadable/corrupt journal) denies exactly as before."""
+    identity = binding.get("identity") if isinstance(binding, dict) else None
+    generation = binding.get("generation") if isinstance(binding, dict) else None
+    expiry_ms = binding.get("expiryMs") if isinstance(binding, dict) else None
+    expected_terminal = binding.get("terminalAt") if isinstance(binding, dict) else None
+    require_expired = binding.get("requireExpired", True) if isinstance(binding, dict) else None
+    if not (isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity)
+            and isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{64}", generation)
+            and isinstance(expiry_ms, int) and not isinstance(expiry_ms, bool) and expiry_ms > 0
+            and (expected_terminal is None or (isinstance(expected_terminal, int) and not isinstance(expected_terminal, bool) and expected_terminal > 0))
+            and isinstance(require_expired, bool)):
+        deny("INVALID_STAGED_JOURNAL_BINDING")
+    rel = str(target.get("relativePath") or "")
+    if not STAGED_SLOT_REL_RE.match(rel):
+        deny("INVALID_STAGED_JOURNAL_BINDING")
+    reason = "锁内复检发现暂存槽 journal 不再符合过期回收资格，拒绝隔离"
+
+    def trusted_int(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+    # Same path-guard discipline the engine's own manifest readers use (the slot lock, already
+    # held by the caller, keeps a racing receiver from rewriting between read and rename).
+    journal_full = path_guard(root, rel + "/manifest.json")
+    try:
+        with open(journal_full, "rb") as handle:
+            payload = handle.read(262144)
+        manifest_mtime = os.stat(journal_full, follow_symlinks=False).st_mtime
+    except OSError:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    try:
+        row = json.loads(payload)
+    except ValueError:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if not isinstance(row, dict) or row.get("identity") != identity or row.get("generation") != generation \
+            or row.get("status") != "committed":
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    # FINAL REVIEW P1-A: presence/format of EVERY field is enforced before any basis is chosen —
+    # a written-but-null updatedAt or terminalAt is malformed, never a slip to older evidence —
+    # and a binding that froze the terminal moment demands it back: a journal that LOST terminalAt
+    # after the report is a different journal, no fallback.
+    created = trusted_int(row.get("createdAt"))
+    if "createdAt" in row and created is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    created_s = created / 1_000_000_000 if created and created > 1_000_000_000_000 else float(created or 0)
+    terminal = row.get("terminalAt")
+    if "terminalAt" in row and trusted_int(terminal) is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    updated = row.get("updatedAt")
+    if "updatedAt" in row and trusted_int(updated) is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if terminal is None and expected_terminal is not None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if terminal is not None:
+        # A binding carrying the terminal moment binds it EXACTLY: a fresh re-commit (new or
+        # missing terminalAt) is a different journal, whatever else still matches.
+        if expected_terminal is not None and terminal != expected_terminal:
+            deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+        basis = float(terminal)
+    elif updated is not None:
+        basis = float(updated)
+    else:
+        basis = manifest_mtime
+    # The three consistency rules (malformed above, future, createdAt-contradiction) apply to
+    # EVERY basis actually used under the lock — not only to the mtime fallback branch. They also
+    # apply to a user-confirmed release: that mode skips ONLY the age threshold below.
+    now = time.time()
+    if basis > now or (created_s and basis < created_s - 1):
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if require_expired and (now - basis) * 1000 < expiry_ms:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+
 
 def archived_control_rel(target):
     """Exact confirmed-path deletion target for one registered isolated subtree."""
@@ -1081,12 +1246,28 @@ def isolation_state(root, destination_rel):
     return record
 
 
-def register_isolation(root, destination_rel, source_rel, operation_id, value, moment):
+ISOLATION_COMPLETION_KEYS = ("isolationCompletionProtocol", "archiveBatch", "sourceRelativePath",
+                             "destinationRelativePath", "renameCommitted", "sourceMissingAtMove",
+                             "registered", "executorsChecked", "executors")
+
+
+def register_isolation(root, destination_rel, source_rel, operation_id, value, moment, completion=None):
     # The pending isolation mapping survives a lost response; it is removed
     # only by a user-confirmed permanent deletion or a completed restore.
-    write_control_json(root, isolation_control_rel(destination_rel), {
-        "schemaVersion": 1, "state": "isolated", "operationId": operation_id, "destination": destination_rel,
-        "source": source_rel, "type": value["type"], "inode": value["inode"], "isolatedAt": moment})
+    # Optional completion facts are the move-moment facts THIS call observed
+    # (atomic rename committed, source name absent during the move, the
+    # node-local managed-window sweep found no overlapping cleanup executor).
+    # A settlement repair passes no completion dict on purpose: a later repair
+    # cannot re-observe the move moment and must never fabricate these fields.
+    record = {"schemaVersion": 1, "state": "isolated", "operationId": operation_id, "destination": destination_rel,
+              "source": source_rel, "type": value["type"], "inode": value["inode"], "isolatedAt": moment}
+    if value.get("device") is not None:
+        record["device"] = value["device"]
+    if isinstance(completion, dict):
+        for key in ISOLATION_COMPLETION_KEYS:
+            if key in completion:
+                record[key] = completion[key]
+    write_control_json(root, isolation_control_rel(destination_rel), record)
 
 
 # ---------------------------------------------------------------------------
@@ -1135,7 +1316,13 @@ def fast_entry_check(root, item, operation_id):
     archived = bool(ARCHIVED_BATCH_RE.match(rel))
     full = path_guard(root, rel, allow_clean=archived, missing=True)
     if not os.path.lexists(full):
-        return {"relativePath": rel, "type": item["type"], "missing": True, "absolutePath": full, "archived": archived}
+        row = {"relativePath": rel, "type": item["type"], "missing": True, "absolutePath": full, "archived": archived}
+        if archived:
+            # A missing archived entry still answers from its registration, so
+            # a finished permanent deletion stays distinguishable from an
+            # unexplained absence; nothing is created or touched here.
+            row["isolationState"] = (isolation_state(root, rel) or {}).get("state")
+        return row
     st = os.lstat(full)
     actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
     if actual != item["type"]:
@@ -1147,6 +1334,11 @@ def fast_entry_check(root, item, operation_id):
     if archived:
         state = isolation_state(root, rel)
         row["isolationState"] = (state or {}).get("state")
+        # Move-moment facts persisted with the registration at rename time,
+        # whitelisted verbatim; an older record simply carries no such keys.
+        completion = {name: state[name] for name in ISOLATION_COMPLETION_KEYS if isinstance(state, dict) and name in state}
+        if completion:
+            row["isolationCompletion"] = completion
     elif actual == "directory":
         row["isolationName"] = isolation_name(operation_id, rel, os.path.basename(full))
     for key in ("device", "inode"):
@@ -1543,8 +1735,14 @@ def isolate_inspect(root, target, operation_id=None):
         value["fingerprint"] = digest({"target": value["fingerprint"], "formalOwnerSha256": owner_hash})
     if target.get("activityEvidenceMode") == "managed_tmux":
         managed_active(root, target, full, value)
-    for executor in current_cleanup_executors(root, full, operation_id):
-        deny("ACTIVE_CLEANUP_EXECUTOR", executor["windowId"], "已有清理执行器正在处理重叠目标")
+    executors = current_cleanup_executors(root, full, operation_id)
+    if executors:
+        deny("ACTIVE_CLEANUP_EXECUTOR", executors[0]["windowId"], "已有清理执行器正在处理重叠目标")
+    # Node-local move-stage fact: THIS inspect swept the managed cleanup
+    # windows and found none overlapping the target. It proves only this
+    # instant on this node and is never re-presented as a later check.
+    value["executorsChecked"] = True
+    value["executors"] = []
     for name in target.get("requiredInputs") or ():
         input_full = path_guard(root, relative(name), True, True)
         if os.path.lexists(input_full) and (input_full == full or below(full, input_full)):
@@ -1631,17 +1829,23 @@ def acquire_target_locks(root, rels):
     return opened
 
 
-def finalize_managed_window(root, request):
+def finalize_managed_window(root, request, completion=None):
     """C3 server-side self close: persist the minimal anti-replay completion
     identity first, then release exactly this request's bound pane — proven
     live, matching @sftp_cleanup and still marked remain-on-exit — by turning
     the flag off and destroying that single pane. A wrapper that exits without
     closing (tmux 3.0a/3.2a/3.3a keep a remain-on-exit window through a later
     flag change and shell teardown) must not leave a dead window behind.
-    Failures keep the window for inspection; never re-delete."""
+    Failures keep the window for inspection; never re-delete.
+    For an isolation move, the completion record additionally persists the
+    move-moment facts this very process observed (the whitelisted completion
+    dict); they describe the move, never a later deletion-time check."""
     key = managed_key({**request, "cleanupAction": request["action"]})
-    write_control_json(root, completion_control_rel(key), {"schemaVersion": 1, "state": "completed", "cleanupKey": key,
-                                                           "operationId": request["operationId"], "action": request["action"], "completedAt": time.time()})
+    completion_record = {"schemaVersion": 1, "state": "completed", "cleanupKey": key,
+                         "operationId": request["operationId"], "action": request["action"], "completedAt": time.time()}
+    if isinstance(completion, dict):
+        completion_record["completion"] = {name: completion[name] for name in ISOLATION_COMPLETION_KEYS if name in completion}
+    write_control_json(root, completion_control_rel(key), completion_record)
     try:
         pane = os.environ.get("TMUX_PANE", "")
         if not pane:
@@ -1823,8 +2027,15 @@ def managed_observe(request):
                 or receipt.get("state") != "completed"):
             deny("CLEANUP_INPUT_CHANGED")
         if receipt is not None:
-            return {"ok": True, "state": "completed", "verifiedBy": "completion_receipt", "irreversible": request["cleanupAction"] == "delete",
-                    "finalizePending": bool(executor and not executor["dead"]), "rootIdentity": identity, "executor": executor}
+            answer = {"ok": True, "state": "completed", "verifiedBy": "completion_receipt", "irreversible": request["cleanupAction"] == "delete",
+                      "finalizePending": bool(executor and not executor["dead"]), "rootIdentity": identity, "executor": executor}
+            completion = receipt.get("completion")
+            if isinstance(completion, dict) and request.get("cleanupAction") == "isolate":
+                # The persisted move-moment facts, echoed verbatim through the
+                # whitelist. They describe THIS node at move time and are
+                # never re-derived from the current filesystem here.
+                answer["completion"] = {name: completion[name] for name in ISOLATION_COMPLETION_KEYS if name in completion}
+            return answer
     if request.get("frozenTargetDigest") and (executor and not executor["dead"] or os.path.lexists(source)):
         frozen = frozen_observation_target(root, request, key)
         if frozen is None:
@@ -2110,36 +2321,75 @@ def main(request):
     if request.get("isolate") is True:
         if action != "inspect":
             deny("INVALID_REQUEST")
-        return {"ok": True, "rootIdentity": identity, "target": isolate_inspect(root, target, request.get("operationId"))}
+        # Per-backend version fact for the background-delete chain: the JS
+        # side only advertises safety.backgroundIsolatedDelete when EVERY
+        # isolate inspect of this backend answered with this flag. An older
+        # engine keeps the old downgrade chain honest.
+        # 0.2.114: staged-slot inspects additionally answer THIS engine's support for the
+        # user-confirmed early release (requireExpired:false recheck mode) with the same
+        # per-backend proof discipline; anything else (or an older engine) stays silent.
+        return {"ok": True, "rootIdentity": identity, "backgroundIsolatedDelete": 1,
+                **({"userConfirmedSlotRelease": 1}
+                   if STAGED_SLOT_REL_RE.match(str(target.get("relativePath") or "")) else {}),
+                "target": isolate_inspect(root, target, request.get("operationId"))}
     if action == "isolate":
         batch = target.get("archiveBatch")
         if batch is None or not isinstance(batch, str) or not re.fullmatch(r"job-[a-f0-9]{48}", batch):
             deny("UNSAFE_ARCHIVE_BATCH")
         if target.get("destination") != "clean_dir/" + batch + "/" + target["relativePath"]:
             deny("UNSAFE_DESTINATION")
+        # ONE live pre-write authorization (top-level identity, ownership,
+        # required inputs, node-local executor sweep). The former second full
+        # isolate_inspect sat a few syscalls before the rename, re-read the
+        # same fixed-name manifests and the same git status, and added no
+        # protection a racing writer could not bypass anyway; it is removed.
+        # What still re-runs immediately before the mutation is exactly the
+        # structural set: destination non-overwrite, path_guard and the
+        # verified direct parent. A lost response stays unknown: the caller
+        # settles through the frozen binding and never re-sends this rename.
         value = isolate_inspect(root, target, request.get("operationId"))
         record = {"operationId": request["operationId"], "action": "isolate", "source": value["absolutePath"], "destination": value["destination"],
                   "type": target["type"], "fingerprint": value["fingerprint"], "sourceRelativePath": target["relativePath"], "time": time.time()}
         audit(root, {**record, "phase": "intent"})
-        checked = isolate_inspect(root, target, request.get("operationId"))
-        if checked["fingerprint"] != value["fingerprint"]:
-            deny("CONTENT_CHANGED")
         path_guard(root, target["destination"], True, True)
+        if os.path.lexists(value["destination"]):
+            deny("DESTINATION_EXISTS", value["destination"])
         os.makedirs(os.path.dirname(value["destination"]), exist_ok=True)
         path_guard(root, target["destination"], True, True)
         child = parent_cd(root, value["absolutePath"])
-        no_replace(child, value["destination"])
-        # Foreground proof is top-level identity plus the rename result, not a
-        # recursive content hash of the isolated tree.
-        after = top_identity(value["destination"], target["type"])
-        if after["inode"] != value["inode"] or after["device"] != value["device"] or after["mtime"] != value["mtime"]:
-            deny("MOVE_VERIFICATION_FAILED")
-        if os.path.lexists(value["absolutePath"]):
-            deny("SOURCE_STILL_EXISTS")
-        register_isolation(root, os.path.relpath(value["destination"], root).replace(os.sep, "/"), relative(target["relativePath"]),
-                           request["operationId"], value, time.time())
+        # Staged slots additionally prove the slot lock is FREE at THIS rename moment
+        # (held across the rename until the source name is gone), closing the window
+        # between an earlier preview and the mutation; a racing claim keeps its flock
+        # and this isolation refuses instead of moving an active checkpoint.
+        slot_lock = staged_slot_lock(root, target)
+        try:
+            # Reclaim-bound isolations re-prove the FULL expiry eligibility here — identity,
+            # generation, committed status, terminal moment and age against the CURRENT journal,
+            # under the held slot lock and before the rename (a free lock alone proves nothing
+            # about the journal); an unbound isolate keeps exactly the previous lock-only gate.
+            if request.get("stagedJournal") is not None:
+                verify_staged_journal_binding(root, target, request["stagedJournal"])
+            # Exactly one atomic rename; a missing no-replace primitive or a
+            # cross-filesystem target fails closed, never degrades to a copy.
+            no_replace(child, value["destination"])
+            # Completion proof for this move: the atomic no-replace rename
+            # committed, the source name is absent in this very move, the
+            # registration lands, and the durable completion audit line below
+            # closes the record. The isolated copy itself is NOT re-read here;
+            # this receipt never claims the isolated content was re-verified.
+            if os.path.lexists(value["absolutePath"]):
+                deny("SOURCE_STILL_EXISTS")
+        finally:
+            release_staged_slot_lock(slot_lock)
+        destination_rel = os.path.relpath(value["destination"], root).replace(os.sep, "/")
+        completion = {"isolationCompletionProtocol": 1, "archiveBatch": batch,
+                      "sourceRelativePath": target["relativePath"], "destinationRelativePath": target["destination"],
+                      "renameCommitted": True, "sourceMissingAtMove": True, "registered": True,
+                      "executorsChecked": True, "executors": value["executors"]}
+        register_isolation(root, destination_rel, relative(target["relativePath"]),
+                           request["operationId"], value, time.time(), completion)
         audit(root, {**record, "phase": "completed"})
-        return {"ok": True, "rootIdentity": identity, "receipt": {**record, "phase": "completed"}}
+        return {"ok": True, "rootIdentity": identity, "receipt": {**record, "phase": "completed", **completion}}
     archived_control = archived_control_rel(target)
     if archived_control is not None and action == "delete":
         archived_state = isolation_state(root, archived_control)
@@ -2310,8 +2560,17 @@ if __name__ == "__main__":
         # anti-replay completion identity is persisted before the window is
         # released; failure keeps remain-on-exit on and the window preserved.
         if request.get("managedInner") is True and result.get("ok") and action in ("delete", "move", "restore", "isolate"):
+            completion = None
+            if action == "isolate" and isinstance(result.get("receipt"), dict) \
+                    and result["receipt"].get("isolationCompletionProtocol") == 1:
+                candidate = {name: result["receipt"][name] for name in ISOLATION_COMPLETION_KEYS if name in result["receipt"]}
+                # The bounded control read keeps its 4096-byte limit; an
+                # oversized completion echo is simply omitted (the isolated
+                # copy then keeps the older review chain), never truncated.
+                if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 3072:
+                    completion = candidate
             try:
-                result["finalize"] = finalize_managed_window(checked_root, request)
+                result["finalize"] = finalize_managed_window(checked_root, request, completion)
             except GuardError as error:
                 result["finalize"] = {"finalized": False, "receiptWritten": False, "code": error.code}
     except GuardError as error:

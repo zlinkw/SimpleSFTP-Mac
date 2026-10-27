@@ -56,7 +56,8 @@ function transferFromApiParams(name, params, remoteMutation) {
 
 function fixture() {
   const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "iso-failclosed-"));
-  const state = { calls: [], mutations: 0, checkState: "pending", startGate: Promise.resolve() };
+  const consumerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "iso-failclosed-project-"));
+  const state = { consumerRoot, calls: [], mutations: 0, checkState: "pending", startGate: Promise.resolve() };
   const transport = async request => {
     const action = String(request.action || ""); const root = request.root; state.calls.push(action);
     if (action === "inspect") return { ok: true, rootIdentity: identity(root), target: shape(root, request.target) };
@@ -88,8 +89,8 @@ function isolateTarget(node, relativePath) {
 }
 async function previewIsolate(state, nodeId, relativePath) {
   const node = nodeFor(nodeId); const target = isolateTarget(node, relativePath);
-  const preview = await state.methods["files.cleanup.preview"]({ node, action: "isolate", observationMode: "managed_tmux", targets: [target] });
-  const approved = { token: preview.token, digest: preview.digest, index: 0 };
+  const preview = await state.methods["files.cleanup.preview"]({ consumerRoot: state.consumerRoot, node, action: "isolate", observationMode: "managed_tmux", targets: [target] });
+  const approved = { consumerRoot: state.consumerRoot, token: preview.token, digest: preview.digest, index: 0 };
   await state.methods["files.cleanup.confirm"](Object.assign({}, approved, { phase: 1, confirm: true, exactTargets: [preview.targets[0].absolutePath] }));
   return Object.assign({ node }, approved);
 }
