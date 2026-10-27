@@ -43,6 +43,23 @@ const COMMON_FUNCTIONS = [
 ];
 const TRANSFER_RANGE = rangeSlice("async function transferChunkedServerFile(", "async function syncServerToServerFpsync(");
 const FPSYNC_RANGE = rangeSlice("async function syncServerToServerFpsyncCore(", "async function syncFromRemoteCore(");
+// Windows 0.2.114 同步后，fpsync 主链在切片之外还依赖 transferSequence 计数器和三个模块级函数；
+// 这里用本文件已有的 functionSlice 从 extension.js 取同一份生产实现注入沙箱：不写替身、不改任何断言。
+// mapped 模式另有沙箱内替身，所以只在 fpsync 且非 mapped 时注入，避免相互覆盖。
+// transferScope64 / stagedScope / stagedLogicalKey 是同一段生产代码（逐字取自 extension.js），
+// fpsync 主链在切片之外调用它们，因此整段一起注入；nextTransferId 依赖模块级 transferSequence 计数器。
+// fpsync 主链在切片之外还调用暂存作用域与暂存槽过期配置：以下片段全部逐字取自 extension.js。
+// 唯一替身是编辑器配置 API（与各测试文件既有替身一致：一律回退默认值），生产配置读取逻辑本身不替换。
+// 1890 起的整段暂存/传输辅助函数在切片之外被 fpsync 主链调用：区间内只有函数声明与一个字面量常量，注入不产生额外副作用。
+const FPSYNC_SCOPE_CLUSTER = rangeSlice("function transferScope64(", "async function transferChunkedServerFile(");
+const FPSYNC_CONFIG_CLUSTER = [
+  rangeSlice("const API_CONFIG_NAMESPACE = ", "const SIMPLE_SFTP_CONFIG_KEYS"),
+  functionSlice("simpleSftpConfigValue"), functionSlice("simpleSftpConfigSuffix"), functionSlice("simpleSftpConfigSchema"),
+].join(String.fromCharCode(10));
+// fpsync 模式一律注入生产整段（含暂存作用域与过期配置读取）；nextTransferId 只在非 mapped 时注入，
+// 因为 mapped 沙箱已有同名替身，函数声明会覆盖它。
+const FPSYNC_PRODUCTION_CLUSTER = [FPSYNC_SCOPE_CLUSTER, FPSYNC_CONFIG_CLUSTER].join(String.fromCharCode(10));
+const TRANSFER_ID_RANGE = ["let transferSequence = 0;", functionSlice("nextTransferId")].join(String.fromCharCode(10));
 const PROBE_RANGE = rangeSlice("async function negotiateTransferCompression(", "function tarPackingCommand(");
 const REAL_BATCH_RANGE = rangeSlice("function remoteBatchStage(", "function hashQuiescenceHelpers(");
 const MAPPED_CONSTANTS = rangeSlice("const MAPPED_DOWNLOAD_DEFAULT_MAX_FILE_BYTES", "function assertSafeScopedLocalPaths(");
@@ -81,6 +98,10 @@ function createTransferHarness(options = {}) {
     __dirname: path.join(__dirname, "..", ".."),
     process: { platform, arch: platform === "darwin" ? "arm64" : "x64", pid: 4242, hrtime: process.hrtime },
     crypto: require("node:crypto"),
+    // 配置 API 边界替身：get 一律回退默认值，与 test/compressedWorkerBatch.test.js 等既有写法一致。
+    // 生产里 PACKAGE_JSON 就是 require("./package.json")；沙箱取同一份文件，保证 schema 默认值一致。
+    PACKAGE_JSON: require(path.join(REPO_ROOT, "package.json")),
+    vscode: { workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) } },
     FPSYNC_PARALLEL_STREAMS: options.parallel == null ? 2 : options.parallel,
     FPSYNC_MAX_BATCH_BYTES: options.maxBatchBytes == null ? 512 * 1024 * 1024 : options.maxBatchBytes,
     transferContext: {
@@ -193,6 +214,9 @@ function createTransferHarness(options = {}) {
     options.mapped ? MAPPED_TAIL.join("\n") : "",
     TRANSFER_RANGE,
     options.fpsync ? FPSYNC_RANGE : "",
+    // 传输编排切片（无条件注入）本身也调用暂存作用域函数，因此生产片段同样无条件注入；仅 nextTransferId 保持按模式注入。
+    FPSYNC_PRODUCTION_CLUSTER,
+    options.fpsync && !options.mapped ? TRANSFER_ID_RANGE : "",
     options.mapped ? MAPPED_CHAIN : "",
     options.mapped ? `this.downloadMappedPathsMethod = ${API_METHOD_SOURCE};` : "",
   ].join("\n");
