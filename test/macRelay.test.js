@@ -47,7 +47,11 @@ function harness(options = {}) {
     Buffer, console, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask, AbortController,
     process: { ...process, platform: "darwin", arch: "arm64" },
     require(name) {
-      if (name === "vscode") return { TreeItem: class {}, ProgressLocation: { Notification: 1 } };
+      // 同步后的传输主链会读暂存槽过期配置：替身补上配置 API（一律回退默认值），其余保持原样。
+      if (name === "vscode") return {
+        TreeItem: class {}, ProgressLocation: { Notification: 1 },
+        workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
+      };
       if (name === "child_process") return { ...runtimeRequire(name), spawn: fakeSpawn };
       if (name === "./host-operation-lease.js") return { HostOperationLeaseManager: LeaseManager, HostOperationLeaseConflictError: class extends Error {} };
       return runtimeRequire(name);
