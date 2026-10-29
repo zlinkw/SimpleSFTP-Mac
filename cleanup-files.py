@@ -1522,6 +1522,124 @@ def batch_observe(root, identity, request):
             "metrics": {"selected": len(observations), "executorQueries": 1 if checked else 0}}
 
 
+def isolation_parent_paths(destinations):
+    if not isinstance(destinations, list) or not 1 <= len(destinations) <= 5000:
+        deny("EMPTY_ISOLATION_SCOPE_INVALID")
+    parents = set()
+    for destination in destinations:
+        if not isinstance(destination, str) or not ARCHIVED_BATCH_RE.fullmatch(destination):
+            deny("EMPTY_ISOLATION_SCOPE_INVALID")
+        relative(destination)
+        parts = destination.split("/")[:-1]
+        while len(parts) >= 2:
+            parents.add("/".join(parts))
+            parts.pop()
+    return sorted(parents, key=lambda name: (-name.count("/"), name))
+
+
+def isolation_parent_control(parent):
+    return "clean_dir/.operations/isolation-parents/" + hashlib.sha256(parent.encode("utf-8")).hexdigest() + ".json"
+
+
+def make_isolation_parents(root, destination):
+    """Record only containers this isolation actually creates, never clean_dir itself."""
+    relative_destination = os.path.relpath(destination, root).replace(os.sep, "/")
+    if not ARCHIVED_BATCH_RE.fullmatch(relative_destination):
+        deny("EMPTY_ISOLATION_SCOPE_INVALID")
+    parts = relative_destination.split("/")[:-1]
+    for count in range(1, len(parts) + 1):
+        rel = "/".join(parts[:count])
+        full = path_guard(root, rel, True, True)
+        if os.path.lexists(full):
+            if not stat.S_ISDIR(os.lstat(full).st_mode):
+                deny("TYPE_CHANGED", full)
+            continue
+        os.mkdir(full)
+        if count >= 2:
+            info = os.lstat(full)
+            write_control_json(root, isolation_parent_control(rel), {"path": rel, "batch": parts[1],
+                "device": str(info.st_dev), "inode": str(info.st_ino)})
+
+
+def inspect_isolation_parents(root, identity, request):
+    destinations = request.get("destinations")
+    paths = isolation_parent_paths(destinations)
+    future = request.get("forReplacement") is True
+    if not future and any((isolation_state(root, destination) or {}).get("state") != "deleted" for destination in destinations):
+        return {"ok": True, "rootIdentity": identity, "eligible": False, "targets": []}
+    targets = []
+    for rel in paths:
+        full = path_guard(root, rel, True, True)
+        if not os.path.lexists(full):
+            if future:
+                targets.append({"relativePath": rel, "absolutePath": full, "type": "directory", "future": True})
+            continue
+        info = os.lstat(full)
+        if not stat.S_ISDIR(info.st_mode):
+            deny("TYPE_CHANGED", full)
+        owned = read_control_json(root, isolation_parent_control(rel))
+        if future and (not owned or owned.get("batch") != rel.split("/")[1]
+                       or owned.get("device") != str(info.st_dev) or owned.get("inode") != str(info.st_ino)):
+            continue  # Existing unowned containers never become implicit deletion targets.
+        targets.append({"relativePath": rel, "absolutePath": full, "type": "directory",
+                        "device": str(info.st_dev), "inode": str(info.st_ino)})
+    # A legacy review may authorize only a known empty hierarchy, never its files.
+    if not future:
+        approved = {row["relativePath"] for row in targets}
+        for row in targets:
+            full = row["absolutePath"]
+            for child in os.listdir(full):
+                child_rel = row["relativePath"] + "/" + child
+                if child_rel not in approved:
+                    return {"ok": True, "rootIdentity": identity, "eligible": False, "targets": [], "reason": "EMPTY_ISOLATION_PARENT_NOT_EMPTY"}
+    return {"ok": True, "rootIdentity": identity, "eligible": True, "targets": targets}
+
+
+def prune_isolation_parents(root, identity, request):
+    if request.get("rootIdentity") != identity or request.get("parentConfirmations") != 2:
+        deny("CONFIRM_REQUIRED")
+    allowed = set(isolation_parent_paths(request.get("destinations")))
+    if any((isolation_state(root, destination) or {}).get("state") != "deleted" for destination in request["destinations"]):
+        deny("ISOLATION_DELETE_NOT_COMPLETED")
+    entries = request.get("entries")
+    if not isinstance(entries, list) or not all(isinstance(row, dict) for row in entries) or len(entries) > 5000 or len({row.get("relativePath") for row in entries}) != len(entries):
+        deny("EMPTY_ISOLATION_SCOPE_INVALID")
+    checked = []
+    for row in entries:
+        rel = row.get("relativePath")
+        if rel not in allowed or row.get("type") != "directory":
+            deny("EMPTY_ISOLATION_SCOPE_INVALID")
+        full = path_guard(root, rel, True, True)
+        if not os.path.lexists(full):
+            continue
+        expected = read_control_json(root, isolation_parent_control(rel)) if row.get("future") else row
+        info = os.lstat(full)
+        if not expected or row.get("future") and (expected.get("path") != rel or expected.get("batch") != rel.split("/")[1]) \
+                or not stat.S_ISDIR(info.st_mode) or expected.get("device") != str(info.st_dev) or expected.get("inode") != str(info.st_ino):
+            deny("ENTRY_IDENTITY_CHANGED", full)
+        checked.append((rel, full, str(info.st_dev), str(info.st_ino)))
+    actual = {row[0] for row in checked}
+    for rel, full, _, _ in checked:
+        if any(rel + "/" + leaf not in actual for leaf in os.listdir(full)):
+            deny("EMPTY_ISOLATION_PARENT_NOT_EMPTY", full)
+    removed = 0
+    for rel, full, device, inode in sorted(checked, key=lambda row: (-row[0].count("/"), row[0])):
+        path_guard(root, rel, True)
+        child = parent_cd(root, full)
+        info = os.lstat(child)
+        if not stat.S_ISDIR(info.st_mode) or str(info.st_dev) != device or str(info.st_ino) != inode or os.listdir(child):
+            deny("ENTRY_IDENTITY_CHANGED", full)
+        FAST_MUTATION_FACTS["started"] = True
+        os.rmdir(child)  # Atomic empty-directory removal; never recursively remove contents.
+        if os.path.lexists(child):
+            deny("TARGET_STILL_EXISTS", full)
+        removed += 1
+        if read_control_json(root, isolation_parent_control(rel)):
+            write_control_json(root, isolation_parent_control(rel), {"removed": True})
+    return {"ok": True, "state": "completed", "rootIdentity": identity,
+            "receipt": {"phase": "completed", "emptyDirectoriesRemoved": removed}}
+
+
 def fast_tree_remove(root, entry_abs, allow_clean, stats):
     """Post-order removal of one fully authorized tree under the ./<leaf> rule.
 
@@ -2179,6 +2297,17 @@ def managed_start(request):
 
 def main(request):
     root, identity = root_guard(request["root"])
+    if request.get("action") == "check-isolation-parents":
+        entries = request.get("entries") or []
+        allowed = set(isolation_parent_paths(request.get("destinations")))
+        if any(row.get("relativePath") not in allowed for row in entries):
+            deny("EMPTY_ISOLATION_SCOPE_INVALID")
+        return {"ok": True, "rootIdentity": identity, "state": "completed" if all(
+            not os.path.lexists(path_guard(root, row["relativePath"], True, True)) for row in entries) else "unknown"}
+    if request.get("action") == "inspect-isolation-parents":
+        return inspect_isolation_parents(root, identity, request)
+    if request.get("action") == "prune-isolation-parents":
+        return prune_isolation_parents(root, identity, request)
     expected_owner = request.get("target", {}).get("expectedOwner")
     if expected_owner is not None and not isinstance(expected_owner, dict):
         deny("OWNERSHIP_UNVERIFIED")
@@ -2354,7 +2483,7 @@ def main(request):
         path_guard(root, target["destination"], True, True)
         if os.path.lexists(value["destination"]):
             deny("DESTINATION_EXISTS", value["destination"])
-        os.makedirs(os.path.dirname(value["destination"]), exist_ok=True)
+        make_isolation_parents(root, value["destination"])
         path_guard(root, target["destination"], True, True)
         child = parent_cd(root, value["absolutePath"])
         # Staged slots additionally prove the slot lock is FREE at THIS rename moment
@@ -2511,7 +2640,7 @@ if __name__ == "__main__":
         raw = sys.stdin.buffer.read(MAX_CLEANUP_REQUEST_BYTES + 1).rstrip(b"\x00")
         request = decode_request(raw)
         action = request.get("action")
-        if action in ("move", "delete", "restore", "settle", "isolate", "managed-start", "delete-fast"):
+        if action in ("move", "delete", "restore", "settle", "isolate", "managed-start", "delete-fast", "prune-isolation-parents"):
             checked_root, _ = root_guard(request["root"])
         if action == "managed-start":
             # C2: the root lock stays a short control transaction covering the
@@ -2525,7 +2654,7 @@ if __name__ == "__main__":
                     if error.code != "OPERATION_BUSY" or time.monotonic() >= deadline:
                         raise
                     time.sleep(0.02)
-        elif action == "delete-fast":
+        elif action in ("delete-fast", "prune-isolation-parents"):
             entries = request.get("entries") or []
             rels = [entry.get("relativePath") for entry in entries if isinstance(entry, dict)] \
                 if isinstance(entries, list) else []

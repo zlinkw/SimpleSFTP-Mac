@@ -56,6 +56,7 @@ class LocalApiServer {
     this.methods = options.methods && typeof options.methods === "object" ? options.methods : {};
     this.methodOptions = options.methodOptions || {};
     this.discoveryPath = options.discoveryPath || "";
+    this.getWorkspace = typeof options.getWorkspace === "function" ? options.getWorkspace : () => ({ workspace: String(options.workspace || "") });
     this.sseTimeoutMs = positiveNumber(options.sseTimeoutMs, DEFAULT_SSE_TIMEOUT_MS);
     this.maxEvents = Math.max(
       0,
@@ -185,12 +186,22 @@ class LocalApiServer {
     const id = payload.id;
     try {
       const handler = this.methods[payload.method];
+      const assertScope = () => {
+        const instance = String(request.headers['x-simple-api-instance'] || '');
+        let workspace;
+        try { workspace = decodeURIComponent(String(request.headers['x-simple-api-workspace'] || '')); }
+        catch { throw apiError(409, 'API_WORKSPACE_MISMATCH'); }
+        if (instance && instance !== this.instanceId()) throw apiError(409, 'API_INSTANCE_MISMATCH');
+        if (workspace && normalizeWorkspace(workspace) !== normalizeWorkspace(this.workspaceInfo().workspace))
+          throw apiError(409, 'API_WORKSPACE_MISMATCH');
+      };
+      assertScope();
       if (typeof handler !== "function") {
         sendJson(response, 200, rpcError(id, -32601, "Method not found"));
         return;
       }
       const controller = new AbortController();
-      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify", "files.cleanup.observeBatch"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method)
+      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.isolationParentsPreview", "files.cleanup.inspect", "files.cleanup.verify", "files.cleanup.observeBatch"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method)
         || payload.method === "sync.downloadMappedPaths" && payload.params?.memoryOnly === true;
       let queued = true;
       const cancelRead = () => { if (queued || readOnly) controller.abort(new Error("API_READ_CANCELLED")); };
@@ -199,12 +210,13 @@ class LocalApiServer {
       let result;
       try {
         const lane = payload.method === 'sync.projectInventory' && payload.params?.metadataOnly === true ? 'summary'
-          : /^files\.cleanup\.(preview|inspect|check|verify)$/.test(payload.method) ? 'review'
+          : /^files\.cleanup\.(preview|isolationParentsPreview|inspect|check|verify)$/.test(payload.method) ? 'review'
           : /^(sync\.project(?:Tree|TreeState|FileStats)|remote\.listDirs)$/.test(payload.method) ? 'browse'
           : /^(sync\.|upload\.|download\.|agents\.|project\.|handoff\.|downloadScope\.|transfers\.reconcile$|files\.cleanup\.(?:preview|inspect|execute|verify))/.test(payload.method) ? 'files' : 'control';
         result = await this.rpcLanes[lane].run([Symbol(payload.method)], controller.signal, () => {
+          assertScope();
           queued = false;
-          return apiRequestContext.run({ readOnly, signal: controller.signal }, () => {
+          return apiRequestContext.run({ readOnly, signal: controller.signal, assertCurrent: assertScope }, () => {
             controller.signal.throwIfAborted();
             return handler(normalParams(payload.params), this, { signal: controller.signal });
           });
@@ -444,6 +456,9 @@ class LocalApiServer {
       name: this.name,
       version: this.version,
       instanceId: this.instanceId(),
+      pid: process.pid,
+      ...this.workspaceInfo(),
+      windowScope: 1,
       features: { transferSettlementReceipts: true, metadataReadsTransient: true, projectTreeExistenceQuery: true, rpcLaneIsolation: 1,
         ...(this.methodOptions["sync.projectInventory"]?.idlePolicy === "observe-filesystem" ? { fileOperationIdleObservation: 1 } : {}),
         ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true,
@@ -521,12 +536,29 @@ class LocalApiServer {
       token: this.token,
       pid: process.pid,
       startedAt: this.startedAt,
+      instanceId: this.instanceId(),
+      ...this.workspaceInfo(),
+      status: this.disposed ? 'stopped' : 'running',
     };
   }
 
   async writeDiscovery() {
     if (!this.discoveryPath) return;
-    await this.withDiscoveryLease(() => atomicWriteText(this.discoveryPath, `${JSON.stringify(this.discovery(), null, 2)}\n`));
+    await this.withDiscoveryLease(async () => {
+      const text = `${JSON.stringify(this.discovery(), null, 2)}\n`;
+      await atomicWriteText(this.instanceRecordPath(), text);
+      await atomicWriteText(this.discoveryPath, text);
+    });
+  }
+
+  workspaceInfo() {
+    const value = this.getWorkspace() || {};
+    return { workspace: String(value.workspace || ''), workspaceUri: String(value.workspaceUri || '') };
+  }
+
+  instanceRecordPath() {
+    const stamp = this.startedAt.replace(/[^A-Za-z0-9.-]/g, '-');
+    return path.join(path.dirname(this.discoveryPath), 'instances', `${process.pid}_${stamp}.json`);
   }
 
   withDiscoveryLease(work) {
@@ -538,6 +570,7 @@ class LocalApiServer {
   async removeDiscovery() {
     if (!this.discoveryPath) return;
     return this.withDiscoveryLease(async () => {
+      await atomicWriteText(this.instanceRecordPath(), JSON.stringify({ ...this.discovery(), status: 'stopped', token: '', stoppedAt: new Date().toISOString() }));
       try {
       const info = fs.lstatSync(this.discoveryPath);
       if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 16384) throw new Error("API discovery identity is unsafe");
@@ -563,6 +596,11 @@ class LocalApiServer {
     }
     if (failure) throw failure;
   }
+}
+
+function normalizeWorkspace(value) {
+  const normalized = String(value || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
 function normalParams(value) {

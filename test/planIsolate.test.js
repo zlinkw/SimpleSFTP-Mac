@@ -8,6 +8,9 @@ function runFixture(name,timeout){const fixture=path.resolve(__dirname,name),eng
   const proc=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout,windowsHide:true});
   assert.equal(proc.status,0,proc.stderr||proc.stdout);return JSON.parse(proc.stdout);}
 const BATCH='job-'+'a'.repeat(48);
+test('confirmed isolation parent cleanup removes owned empty hierarchy and protects new contents',()=>{
+ assert.deepEqual(runFixture('isolationEmptyParents.fixture.py',10000),{ok:true,onlyEmptyDirectories:true,legacySupported:true});
+});
 function makeApi(overrides={}){const requests=[];const api=new CleanupFileApi({storageRoot:path.join(os.tmpdir(),'plan-isolate-'+process.pid+'-'+Math.random().toString(36).slice(2)),activity:async()=>{},lease:async(_node,_targets,fn)=>fn(),transport:async request=>{requests.push(JSON.parse(JSON.stringify(request)));
   if(request.action==='batch-inspect')return {ok:true,rootIdentity:{path:'/scope'},capabilities:{confirmedPathFastDelete:1,batchEntryInspect:1},targets:request.targets.map(t=>({...t,absolutePath:'/scope/'+t.relativePath,archived:true,device:'1',inode:'7'}))};
   if(request.action==='inspect'){if(overrides.inspect)return overrides.inspect(request);
@@ -17,8 +20,56 @@ function makeApi(overrides={}){const requests=[];const api=new CleanupFileApi({s
   if(request.action==='settle')return overrides.settle?overrides.settle(request):{ok:true,rootIdentity:{path:'/scope'},receipt:{fingerprintMode:'top_level'}};
   if(request.action==='isolate')return overrides.isolate?overrides.isolate(request):{ok:true,rootIdentity:{path:'/scope'},receipt:{phase:'completed'}};
   if(request.action==='check')return {ok:true,state:'pending',rootIdentity:{path:'/scope'}};
+  if(['inspect-isolation-parents','prune-isolation-parents','check-isolation-parents'].includes(request.action)&&overrides.parents)return overrides.parents(request);
   assert.fail('unexpected action '+request.action);}});return {api,requests};}
 const isolateTarget={relativePath:'outputs/run1',type:'directory',archiveBatch:BATCH,destination:'clean_dir/'+BATCH+'/outputs/run1',requiredInputs:['outputs/ckpt.bin']};
+
+test('empty container deletion requires its own exact two confirmations and is idempotent',async()=>{
+ const parent='clean_dir/'+BATCH;let mutations=0;
+ const {api}=makeApi({parents:request=>request.action==='inspect-isolation-parents'
+  ? {ok:true,eligible:true,rootIdentity:{path:'/scope'},targets:[{relativePath:parent,absolutePath:'/scope/'+parent,type:'directory',future:true}]}
+  : (mutations++,{ok:true,state:'completed',rootIdentity:{path:'/scope'},receipt:{phase:'completed',emptyDirectoriesRemoved:1}})});
+ const source=await api.preview({consumerRoot:__CONSUMER__,node:{kind:'remote',root:'/scope'},action:'isolate',observationMode:'managed_tmux',targets:[{...isolateTarget}]});
+ const preview=await api.previewIsolationParents({consumerRoot:__CONSUMER__,isolationToken:source.token,forReplacement:true});
+ assert.equal(preview.sourceIsolationToken,source.token);
+ assert.deepEqual(preview.confirmationPaths,['/scope/'+parent,'/scope/'+isolateTarget.destination]);
+ const binding={consumerRoot:__CONSUMER__,token:preview.token,digest:preview.digest,index:0};
+ await assert.rejects(api.execute(binding),/CONFIRM_REQUIRED/);
+ await assert.rejects(api.confirm({...binding,phase:1,confirm:true,exactTargets:['/scope/clean_dir']}),/CONFIRM_REQUIRED/);
+ await api.confirm({...binding,phase:1,confirm:true,exactTargets:preview.confirmationPaths});
+ await assert.rejects(api.execute(binding),/CONFIRM_REQUIRED/);assert.equal(mutations,0);
+ await api.confirm({...binding,phase:2,confirm:true,exactTargets:preview.confirmationPaths});
+ assert.equal((await api.execute(binding)).state,'completed');assert.equal(mutations,1);
+ assert.equal((await api.execute(binding)).state,'completed');assert.equal(mutations,1);
+ const final=await api.status(binding);assert.deepEqual(final.targets,[]);assert.deepEqual(final.confirmationPaths,[]);
+ const localSource=await api.preview({consumerRoot:__CONSUMER__,node:{kind:'local',root:__CONSUMER__},action:'isolate',targets:[{...isolateTarget}]});
+ const localParents=await api.previewIsolationParents({consumerRoot:__CONSUMER__,isolationToken:localSource.token,forReplacement:true});
+ assert.equal(localParents.confirmationPaths.at(-1),path.join(__CONSUMER__,isolateTarget.destination),'local confirmation uses native Windows paths');
+});
+test('parent review combines backend chunks of one isolation batch and resolves a lost answer by active absence without re-deleting',async()=>{
+ let absent=false,mutations=0,unowned=false;const parent='clean_dir/'+BATCH;
+ const {api,requests}=makeApi({parents:request=>{
+  if(request.action==='inspect-isolation-parents')return{ok:true,eligible:true,rootIdentity:{path:'/scope'},targets:unowned?[]:[{relativePath:parent,absolutePath:'/scope/'+parent,type:'directory',future:true}]};
+  if(request.action==='check-isolation-parents')return{ok:true,rootIdentity:{path:'/scope'},state:absent?'completed':'unknown'};
+  mutations++;return{ok:false,error:{code:'REQUEST_TIMEOUT',message:'lost response'}};
+ }});
+ const sources=[];
+ for(const name of ['one','two'])sources.push(await api.preview({consumerRoot:__CONSUMER__,node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget,relativePath:'outputs/'+name,destination:'clean_dir/'+BATCH+'/outputs/'+name}]}));
+ const preview=await api.previewIsolationParents({consumerRoot:__CONSUMER__,isolationTokens:sources.map(row=>row.token),forReplacement:true});
+ assert.deepEqual(preview.sourceIsolationTokens,sources.map(row=>row.token));
+ assert.equal(requests.find(row=>row.action==='inspect-isolation-parents').destinations.length,2);
+ const binding={consumerRoot:__CONSUMER__,token:preview.token,digest:preview.digest,index:0};
+ for(const phase of [1,2])await api.confirm({...binding,phase,confirm:true,exactTargets:preview.confirmationPaths});
+ await assert.rejects(api.execute(binding),/lost response/);assert.equal(mutations,1);
+ await assert.rejects(api.execute(binding),/OPERATION_OUTCOME_UNKNOWN/);
+ assert.equal((await api.status(binding)).parentOutcome,'unknown');absent=true;
+ assert.equal((await api.status(binding)).parentOutcome,'completed');
+ assert.equal((await api.execute(binding)).state,'completed');assert.equal(mutations,1);
+ unowned=true;const artifactsOnly=await api.previewIsolationParents({consumerRoot:__CONSUMER__,isolationTokens:sources.map(row=>row.token),forReplacement:true});
+ assert.equal(artifactsOnly.eligible,true);assert.deepEqual(artifactsOnly.targets,[]);
+ assert.equal(artifactsOnly.confirmationPaths.length,2,'artifact deletion still requires its own two exact confirmations when no parent is owned');
+ await assert.rejects(api.execute({consumerRoot:__CONSUMER__,token:artifactsOnly.token,digest:artifactsOnly.digest,index:0}),/CONFIRM_REQUIRED/);
+});
 
 test('controlled isolation previews only through the fast top-level inspect and keeps the rerun batch identity',async()=>{
   const {api,requests}=makeApi();
@@ -112,7 +163,7 @@ test('controlled fast isolation, subtree single-writer locks and registered perm
 });
 
 test('the isolate hot path runs one live inspect, one rename and no post-rename re-check of the isolated copy',()=>{
-  const source=fs.readFileSync(path.resolve(__dirname,'../cleanup-files.py'),'utf8');
+  const source=fs.readFileSync(path.resolve(__dirname,'../cleanup-files.py'),'utf8').replace(/\r\n/g,'\n');
   const start=source.indexOf('    if action == "isolate":\n');
   const end=source.indexOf('    archived_control = archived_control_rel(target)',start);
   assert.ok(start>0&&end>start,'isolate branch anchors missing');

@@ -125,8 +125,7 @@ test("production archive builder keeps the scope across changed selections and r
 test("expiry defaults are registered and can never fall below the ruled one-day floor", () => {
   const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../package.json"), "utf8"));
   const props = pkg.contributes.configuration.properties;
-  // Mac 配套身份：默认值与 1 天下限逐值不变，仅改按 Mac 发行版本与 simpleSftpMac.* 配置命名空间核对。
-  assert.equal(pkg.version, "0.2.104");
+  assert.equal(pkg.version, "0.2.105");
   assert.equal(props["simpleSftpMac.autoReclaimExpiredCommittedSlots"].type, "boolean");
   assert.equal(props["simpleSftpMac.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftpMac.stagedSlotCommittedExpiryMs"].default, 86400000);

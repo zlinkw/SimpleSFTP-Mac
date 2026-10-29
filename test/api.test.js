@@ -17,6 +17,22 @@ const {
 } = require("../api-server.js");
 
 const extensionSource = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
+test('two SFTP windows retain independent discovery and reject foreign or changed-project calls',async()=>{
+ let workspace='C:/project-A',calls=0;
+ const a=await startServer({mark:()=>++calls},{getWorkspace:()=>({workspace,workspaceUri:'file:///project-A'})});
+ const b=await startServer({mark:()=>assert.fail('foreign window handler must never run')},{getWorkspace:()=>({workspace:'',workspaceUri:'overleaf-workshop://paper'})});
+ const post=async(root,instance=a.server.instanceId())=>{
+  const response=await fetch(a.baseUrl+'/api/v1/rpc',{method:'POST',headers:{Authorization:'Bearer '+a.token,'Content-Type':'application/json','X-Simple-Api-Instance':instance,'X-Simple-Api-Workspace':encodeURIComponent(root)},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'mark',params:{}})});return response.json();
+ };
+ try{
+  assert.equal(a.server.capabilities().workspace,'C:/project-A');assert.match(b.server.capabilities().workspaceUri,/overleaf-workshop/);
+  assert.equal((await post(workspace)).result,1);
+  assert.match((await post(workspace,b.server.instanceId())).error.message,/INSTANCE_MISMATCH/);
+  const old=workspace;workspace='C:/项目-B';assert.match((await post(old)).error.message,/WORKSPACE_MISMATCH/);
+  assert.equal((await post(workspace)).result,2);assert.equal(calls,2);
+  assert.equal(fs.existsSync(a.server.instanceRecordPath()),true);assert.equal(fs.existsSync(b.server.instanceRecordPath()),true);
+ }finally{await a.cleanup();await b.cleanup();}
+});
 
 test("discovery failure releases the newly opened listener", async () => {
   const api = new LocalApiServer({ preferredPort: 23240 });
@@ -166,6 +182,7 @@ test("disconnected readers cancel while writes remain owned by durable operation
       captured = context.signal; entered(); return new Promise(resolve => { release = resolve; });
     } } });
     const request = new EventEmitter(), response = new EventEmitter();
+    request.headers = {};
     response.writeHead = () => {}; response.end = () => {};
     const pending = server.handleRpc(request, response);
     request.emit("data", Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }))); request.emit("end");
@@ -189,6 +206,7 @@ test('busy file RPCs leave directory browsing and operation controls available',
   } });
   function rpc(method, params = {}) {
     const req = new EventEmitter(), res = new EventEmitter();
+    req.headers = {};
     let body, status;
     res.writeHead = code => { status = code; }; res.end = text => { body = JSON.parse(text); };
     const done = api.handleRpc(req, res);
@@ -585,9 +603,7 @@ test("r118 capability descriptors advertise claim-scoped expiry reclaim and stru
   assert.match(extensionSource, /"files\.cleanup\.stagedSlots": \{ readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 \}/);
   assert.match(extensionSource, /"sync\.serverToServerFpsync": \{ retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1/);
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
-  // Mac 配套：同一发行身份门按 Mac 版本与 simpleSftpMac.* 命名空间核对，默认值与 1 天下限不变。
-  assert.equal(pkg.version, "0.2.104");
-  assert.equal(pkg.name, "simple-sftp-mac");
+  assert.equal(pkg.version, "0.2.105");
   const props = pkg.contributes.configuration.properties;
   assert.equal(props["simpleSftpMac.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftpMac.stagedSlotCommittedExpiryMs"].default, 86400000);

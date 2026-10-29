@@ -972,16 +972,69 @@ class CleanupFileApi {
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target: row.targets[index],
       action: "check", deleted: row.action === "delete", receiptCompleted: row.states[index] === "completed" });
   }
+  async previewIsolationParents(params) {
+    const tokens = params.isolationTokens ?? [params.isolationToken];
+    if (!Array.isArray(tokens) || !tokens.length || tokens.length > 500 || new Set(tokens).size !== tokens.length) fail("INVALID_REQUEST");
+    const originals = [];
+    for (const token of tokens) originals.push(await this.read(token, params.consumerRoot));
+    const original = originals[0];
+    if (originals.some(row => row.action !== "isolate")) fail("NOT_ISOLATION_TOKEN");
+    if (originals.some(row => hash(row.node) !== hash(original.node) || hash(row.rootIdentity) !== hash(original.rootIdentity))) fail("ROOT_IDENTITY_CHANGED");
+    const destinations = [...new Set(originals.flatMap(row => row.targets.filter(target => !target.missing).map(target => target.destination)))];
+    if (new Set(destinations.map(destination => destination.split("/").slice(0, 2).join("/"))).size !== 1) fail("EMPTY_ISOLATION_SCOPE_INVALID");
+    if (!destinations.length) return { ok: true, eligible: false, targets: [] };
+    const result = await this.checked({ node: original.node, root: original.node.root, rootIdentity: original.rootIdentity,
+      action: "inspect-isolation-parents", destinations, forReplacement: params.forReplacement === true });
+    if (hash(result.rootIdentity) !== hash(original.rootIdentity)) fail("ROOT_IDENTITY_CHANGED");
+    if (!result.eligible || (!result.targets?.length && params.forReplacement !== true)) return { ok: true, eligible: false, targets: [], reason: result.reason };
+    const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"),
+      consumerRoot: original.consumerRoot, node: copy(original.node), rootIdentity: copy(original.rootIdentity),
+      action: "delete", authorizationMode: "confirmed_paths", isolationParentCleanup: true,
+      sourceIsolationToken: original.token, sourceIsolationTokens: tokens, destinations, includeIsolatedArtifacts: params.forReplacement === true,
+      targets: copy(result.targets), confirmations: 0, expiresAt: Date.now() + 30 * 60 * 1000,
+      states: result.targets.map(() => "pending"), safety: { emptyDirectoriesOnly: 1, parentCwdRequired: 1, doubleConfirmation: 1 } };
+    row.confirmationPaths = [...row.targets.map(target => target.absolutePath), ...(row.includeIsolatedArtifacts
+      ? destinations.map(destination => original.node.kind === "local" ? path.join(original.node.root, destination)
+        : path.posix.join(original.node.root, destination)) : [])];
+    row.digest = hash({ node: row.node, rootIdentity: row.rootIdentity, sourceIsolationTokens: row.sourceIsolationTokens,
+      targets: row.targets, destinations, confirmationPaths: row.confirmationPaths, safety: row.safety });
+    this.previews.set(row.token, copy(row));
+    return { ...copy(row), eligible: true };
+  }
+  async executeIsolationParents(row, params) {
+    if (params.index !== 0 || row.confirmations !== 2 || params.digest !== row.digest) fail("CONFIRM_REQUIRED");
+    if (row.isolationParentsCompleted) return { ok: true, state: "completed", receipt: row.parentReceipt };
+    if (this.busy.has(row.token) || row.parentOutcome === "executing") fail("OPERATION_BUSY");
+    if (row.parentOutcome === "unknown") fail("OPERATION_OUTCOME_UNKNOWN");
+    this.busy.add(row.token);
+    try {
+      return await this.lease(row.node, row.targets, async () => {
+        row.parentOutcome = "executing"; await this.save(row);
+        let result;
+        try { result = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
+          action: "prune-isolation-parents", parentConfirmations: 2, destinations: row.destinations, entries: row.targets }); }
+        catch (error) { row.parentOutcome = "unknown"; await this.save(row); throw error; }
+        if (result.state !== "completed") fail("CLEANUP_NOT_VERIFIED");
+        row.parentOutcome = "completed"; row.isolationParentsCompleted = true; row.parentReceipt = result.receipt;
+        // Keep completion identity, not an extra archived file/path inventory.
+        row.targets = []; row.states = []; row.confirmationPaths = []; row.destinations = [];
+        await this.save(row);
+        return result;
+      });
+    } finally { this.busy.delete(row.token); }
+  }
   async confirm(params) {
     const row = await this.read(params.token, params.consumerRoot, typeof params.digest === "string" ? params.digest : undefined);
     if (Date.now() > row.expiresAt) fail("PREVIEW_EXPIRED");
-    if (params.confirm !== true || params.digest !== row.digest || hash(params.exactTargets) !== hash(row.targets.filter(t => !t.missing).map(t => t.absolutePath))) fail("CONFIRM_REQUIRED");
+    const exact = row.isolationParentCleanup ? row.confirmationPaths : row.targets.filter(t => !t.missing).map(t => t.absolutePath);
+    if (params.confirm !== true || params.digest !== row.digest || hash(params.exactTargets) !== hash(exact)) fail("CONFIRM_REQUIRED");
     if (params.phase !== row.confirmations + 1 || params.phase > (row.action === "delete" ? 2 : 1)) fail("CONFIRM_REQUIRED");
     row.confirmations = params.phase; await this.save(row);
     return { ok: true, token: row.token, digest: row.digest, confirmations: row.confirmations };
   }
   async execute(params) {
     const row = await this.read(params.token, params.consumerRoot, typeof params.digest === "string" ? params.digest : undefined);
+    if (row.isolationParentCleanup) return this.executeIsolationParents(row, params);
     if (params.digest !== row.digest || row.confirmations !== (row.action === "delete" ? 2 : 1)) fail("CONFIRM_REQUIRED");
     const index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
@@ -1122,6 +1175,21 @@ class CleanupFileApi {
   }
   async status(params) {
     const row = await this.read(params.token, params.consumerRoot, typeof params.backendDigest === "string" ? params.backendDigest : undefined);
+    if (row.isolationParentCleanup) {
+      if (row.isolationParentsCompleted || !row.parentOutcome || this.busy.has(row.token)) return row;
+      try {
+        const proof = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
+          action: "check-isolation-parents", destinations: row.destinations, entries: row.targets });
+        if (hash(proof.rootIdentity) !== hash(row.rootIdentity)) fail("ROOT_IDENTITY_CHANGED");
+        row.parentOutcome = proof.state === "completed" ? "completed" : "unknown";
+        if (proof.state === "completed") {
+          row.isolationParentsCompleted = true; row.parentReceipt = { phase: "completed", verifiedBy: "active_absence" };
+          row.targets = []; row.states = []; row.confirmationPaths = []; row.destinations = [];
+        }
+        delete row.statusQueryError; await this.save(row);
+      } catch (error) { row.statusQueryError = String(error.code || error.message); }
+      return row;
+    }
     if (isFastDeleteRow(row)) {
       // Batched active queries refresh the whole selection in bounded
       // read-only RPCs (fastVerify chunks by expanded entries), never per file.
@@ -1237,6 +1305,11 @@ class CleanupFileApi {
     }
     if (typeof params.digest !== "string" || params.digest !== row.digest) fail("CONFIRM_REQUIRED", undefined, { reason: "后台删除必须绑定该隔离 token 的冻结摘要" });
     if (row.action !== "isolate") fail("NOT_ISOLATION_TOKEN", "后台删除入口只接受已登记的隔离 token，永久删除的通用确认链不变");
+    if (params.parentCleanupToken !== undefined) {
+      const parents = await this.read(params.parentCleanupToken, params.consumerRoot);
+      if (!parents.isolationParentCleanup || !parents.sourceIsolationTokens.includes(row.token) || parents.confirmations !== 2
+          || !parents.includeIsolatedArtifacts || hash(parents.node) !== hash(row.node)) fail("CONFIRM_REQUIRED");
+    }
     // Caller bindings { index, relativePath, destination } are verified ONLY.
     if (params.targets !== undefined) {
       if (!Array.isArray(params.targets)) fail("INVALID_REQUEST");

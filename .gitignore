@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 baseline-source.zip
 release-artifacts/
+clean_dir/
